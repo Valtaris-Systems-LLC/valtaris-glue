@@ -7,6 +7,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { getConnector } from "../_shared/connectors.ts";
+import { requireUser } from "../_shared/auth.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -17,11 +18,17 @@ interface DagNode { id: string; name: string; connector: string; compensation?: 
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+
+  const auth = await requireUser(req);
+  if (!auth.ok) {
+    return new Response(JSON.stringify({ error: auth.error }), { status: auth.status, headers: cors });
+  }
+
   const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   try {
     const body = await req.json();
-    const { run_id, reason, triggered_by = "operator" } = body;
+    const { run_id, reason, triggered_by = auth.ctx.userId } = body;
     if (!run_id) {
       return new Response(JSON.stringify({ error: "run_id required" }), { status: 400, headers: cors });
     }
@@ -65,6 +72,7 @@ Deno.serve(async (req) => {
 
       await sb.from("workflow_events").insert({
         run_id, step_id: s.id,
+        tenant_id: run.tenant_id ?? null,
         type: res.ok ? "rollback.step.completed" : "rollback.step.failed",
         severity: res.ok ? "info" : "error",
         source: "rollback-executor",
@@ -88,6 +96,7 @@ Deno.serve(async (req) => {
 
     await sb.from("workflow_events").insert({
       run_id,
+      tenant_id: run.tenant_id ?? null,
       type: ok ? "rollback.completed" : "rollback.failed",
       severity: ok ? "info" : "error",
       source: "rollback-executor",
@@ -97,7 +106,7 @@ Deno.serve(async (req) => {
 
     if (!ok) {
       await sb.from("workflow_incidents").insert({
-        run_id, severity: "error", category: "rollback_failed",
+        run_id, tenant_id: run.tenant_id ?? null, severity: "error", category: "rollback_failed",
         summary: `Rollback failed for run ${run_id}`,
       });
     }

@@ -16,7 +16,7 @@
 // re-entrant under concurrent invocations.
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { getConnector } from "../_shared/connectors.ts";
+import { getConnector, type ConnectorResult } from "../_shared/connectors.ts";
 import { DEFAULT_POLICY, nextBackoffMs, shouldRetry } from "../_shared/retry.ts";
 import { type DagGraph, isTerminal, nodeById, type NodeState, readyNodes } from "../_shared/dag.ts";
 
@@ -198,7 +198,8 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
       await emit(sb, job.run_id, null, "approval.requested", "warn",
         `⏸ Awaiting approval: ${node.name}`,
-        { approval_id: appr?.id, node_id: node.id, expires_at: expires });
+        { approval_id: appr?.id, node_id: node.id, expires_at: expires },
+        run.tenant_id);
 
       await sb.from("runtime_audit_log").insert({
         actor: "worker", action: "approval.request",
@@ -240,6 +241,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
       .from("workflow_step_runs")
       .insert({
         run_id: job.run_id,
+        tenant_id: run.tenant_id ?? null,
         step_index: stepIndex,
         dag_node_id: node.id,
         name: node.name,
@@ -258,27 +260,42 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
   await emit(sb, job.run_id, step_id, "step.started", "info", `▶ ${node.name}`, {
     connector: node.connector, attempt: job.retry_attempt, dag_node_id: node.id,
-  });
+  }, run.tenant_id);
 
   // Execute via adapter
   const adapter = getConnector(node.connector);
-  const result = await adapter.execute(node.name, job.payload, {
-    timeoutMs: node.timeoutMs,
-    idempotencyKey: job.idempotency_key,
-  });
 
-  // Touch connector_state with measured latency / health
-  await sb.from("connector_state").update({
-    latency_ms: result.latency_ms,
-    last_success_at: result.ok ? new Date().toISOString() : undefined,
-    last_error: result.ok ? null : result.error?.message ?? null,
-    status: result.ok ? "healthy" : (result.error?.kind === "rate_limit" ? "degraded" : result.error?.kind === "timeout" ? "retrying" : "degraded"),
-    updated_at: new Date().toISOString(),
-  }).eq("connector", node.connector);
+  // H3: Enforce circuit breaker — reject execution when breaker is open.
+  const { data: cbAllowed } = await sb.rpc("connector_allowed", { _connector: node.connector });
+  let result: ConnectorResult;
+  if (cbAllowed === false) {
+    result = {
+      ok: false,
+      error: { kind: "upstream_5xx", retryable: true, message: `connector ${node.connector} circuit breaker open` },
+      latency_ms: 0,
+      mock: false,
+      connector: node.connector,
+      action: node.name,
+    };
+  } else {
+    result = await adapter.execute(node.name, job.payload, {
+      timeoutMs: node.timeoutMs,
+      idempotencyKey: job.idempotency_key,
+    });
 
-  // Feed connector outcome into the circuit breaker so persistent failures
-  // trip isolation instead of amplifying retries downstream.
-  await sb.rpc("record_connector_result", { _connector: node.connector, _ok: result.ok });
+    // Touch connector_state with measured latency / health
+    await sb.from("connector_state").update({
+      latency_ms: result.latency_ms,
+      last_success_at: result.ok ? new Date().toISOString() : undefined,
+      last_error: result.ok ? null : result.error?.message ?? null,
+      status: result.ok ? "healthy" : (result.error?.kind === "rate_limit" ? "degraded" : result.error?.kind === "timeout" ? "retrying" : "degraded"),
+      updated_at: new Date().toISOString(),
+    }).eq("connector", node.connector);
+
+    // Feed connector outcome into the circuit breaker so persistent failures
+    // trip isolation instead of amplifying retries downstream.
+    await sb.rpc("record_connector_result", { _connector: node.connector, _ok: result.ok });
+  }
 
 
   if (result.ok) {
@@ -327,12 +344,12 @@ async function processJob(sb: SupabaseClient, job: Job) {
       });
       await emit(sb, job.run_id, step_id, "ai.decision", escalated ? "warn" : "info",
         `AI ${escalated ? "escalated" : "auto-approved"} (${Math.round(confidence * 100)}%)`,
-        { confidence, escalated });
+        { confidence, escalated }, run.tenant_id);
     }
 
     await emit(sb, job.run_id, step_id, "step.completed", "info",
       `✓ ${node.name} (${result.latency_ms}ms${result.mock ? " · mock" : ""})`,
-      { duration_ms: result.latency_ms, mock: result.mock });
+      { duration_ms: result.latency_ms, mock: result.mock }, run.tenant_id);
 
     await sb.from("workflow_jobs").update({
       state: "completed",
@@ -372,7 +389,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
     await emit(sb, job.run_id, step_id, "step.retry", "warn",
       `↻ ${node.name} retry ${nextAttempt}/${policy.maxRetries} in ${backoff}ms`,
-      { backoff_ms: backoff, kind: result.error?.kind });
+      { backoff_ms: backoff, kind: result.error?.kind }, run.tenant_id);
     return;
   }
 
@@ -402,6 +419,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
   await sb.from("workflow_incidents").insert({
     run_id: job.run_id,
+    tenant_id: run.tenant_id ?? null,
     severity: "error",
     category: "dead_letter",
     connector: node.connector,
@@ -410,7 +428,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
   await emit(sb, job.run_id, step_id, "step.failed", "error",
     `✗ ${node.name} dead-lettered (${result.error?.kind ?? "unknown"})`,
-    { kind: result.error?.kind, attempts: nextAttempt });
+    { kind: result.error?.kind, attempts: nextAttempt }, run.tenant_id);
 }
 
 async function enqueueDownstream(sb: SupabaseClient, runId: string, completedNodeId: string) {
@@ -474,6 +492,7 @@ async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
 
   await sb.from("workflow_events").insert({
     run_id: runId,
+    tenant_id: run.tenant_id ?? null,
     type: failed ? "run.failed" : "run.completed",
     severity: failed ? "error" : "info",
     source: "run-worker",
@@ -484,7 +503,9 @@ async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
 
 function emit(
   sb: SupabaseClient, run_id: string, step_id: string | null,
-  type: string, severity: string, message: string, data: Record<string, unknown> = {},
+  type: string, severity: string, message: string,
+  data: Record<string, unknown> = {},
+  tenant_id?: string | null,
 ) {
-  return sb.from("workflow_events").insert({ run_id, step_id, type, severity, source: "run-worker", message, data });
+  return sb.from("workflow_events").insert({ run_id, step_id, type, severity, source: "run-worker", message, data, tenant_id: tenant_id ?? null });
 }
