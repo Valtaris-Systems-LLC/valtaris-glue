@@ -12,6 +12,9 @@
 -- This could silently overwrite a completed job, breaking audit
 -- integrity and downstream idempotency checks.
 -- Fix: add AND j.state NOT IN ('completed','dead_letter','failed').
+--
+-- C4b: approval-expired workflow_events had no tenant_id.
+-- Fix: join workflow_runs via ex.run_id to propagate tenant_id.
 CREATE OR REPLACE FUNCTION public.expire_pending_approvals()
 RETURNS TABLE(expired integer)
 LANGUAGE plpgsql
@@ -35,9 +38,11 @@ BEGIN
     RETURNING 1
   ),
   evt AS (
-    INSERT INTO public.workflow_events(run_id, step_id, type, severity, source, message)
-    SELECT run_id, step_id, 'approval.expired', 'warn', 'governance', 'Approval window expired'
+    INSERT INTO public.workflow_events(run_id, step_id, tenant_id, type, severity, source, message)
+    SELECT ex.run_id, ex.step_id, r.tenant_id,
+           'approval.expired', 'warn', 'governance', 'Approval window expired'
     FROM ex
+    JOIN public.workflow_runs r ON r.id = ex.run_id
     RETURNING 1
   )
   SELECT count(*) INTO n FROM ex;

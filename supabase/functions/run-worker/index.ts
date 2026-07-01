@@ -411,6 +411,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
   await sb.from("workflow_dead_letter").insert({
     job_id: job.id,
     run_id: job.run_id,
+    tenant_id: run.tenant_id ?? null,
     dag_node_id: node.id,
     attempts: nextAttempt,
     last_error: result.error?.message ?? "failed",
