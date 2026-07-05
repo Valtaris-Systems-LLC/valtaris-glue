@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
 import { PageHeader } from "@/components/ui/page-header";
@@ -44,7 +44,7 @@ export default function RuntimeInspector() {
   const [compareId, setCompareId] = useState<string | null>(null);
   const [compareSteps, setCompareSteps] = useState<StepRow[]>([]);
 
-  const loadRuns = async () => {
+  const loadRuns = useCallback(async () => {
     setLoading(true);
     const { data } = await supabase
       .from("workflow_runs")
@@ -55,26 +55,26 @@ export default function RuntimeInspector() {
     setRuns(rows);
     if (!selectedId && rows[0]) setSelectedId(rows[0].id);
     setLoading(false);
-  };
+  }, [selectedId]);
 
-  const loadDetail = async (runId: string, target: "primary" | "compare" = "primary") => {
+  const loadDetail = useCallback(async (runId: string, target: "primary" | "compare" = "primary") => {
     const [stepsRes, evtRes, ckpRes] = await Promise.all([
       supabase.from("workflow_step_runs").select("*").eq("run_id", runId).order("step_index", { ascending: true }),
       supabase.from("workflow_events").select("*").eq("run_id", runId).order("ts", { ascending: true }).limit(500),
       supabase.from("workflow_checkpoints").select("*").eq("run_id", runId).order("ts", { ascending: true }),
     ]);
     if (target === "primary") {
-      setSteps((stepsRes.data ?? []) as any);
-      setEvents((evtRes.data ?? []) as any);
-      setCheckpoints((ckpRes.data ?? []) as any);
+      setSteps((stepsRes.data ?? []) as StepRow[]);
+      setEvents((evtRes.data ?? []) as EventRow[]);
+      setCheckpoints((ckpRes.data ?? []) as CheckpointRow[]);
     } else {
-      setCompareSteps((stepsRes.data ?? []) as any);
+      setCompareSteps((stepsRes.data ?? []) as StepRow[]);
     }
-  };
+  }, []);
 
-  useEffect(() => { if (user) loadRuns(); }, [user]);
-  useEffect(() => { if (selectedId) loadDetail(selectedId, "primary"); }, [selectedId]);
-  useEffect(() => { if (compareId) loadDetail(compareId, "compare"); else setCompareSteps([]); }, [compareId]);
+  useEffect(() => { if (user) void loadRuns(); }, [user, loadRuns]);
+  useEffect(() => { if (selectedId) void loadDetail(selectedId, "primary"); }, [selectedId, loadDetail]);
+  useEffect(() => { if (compareId) void loadDetail(compareId, "compare"); else setCompareSteps([]); }, [compareId, loadDetail]);
 
   // Realtime subscription on selected run
   useEffect(() => {
@@ -84,7 +84,7 @@ export default function RuntimeInspector() {
       .on("postgres_changes", { event: "*", schema: "public", table: "workflow_events", filter: `run_id=eq.${selectedId}` }, () => loadDetail(selectedId))
       .subscribe();
     return () => { supabase.removeChannel(ch); };
-  }, [selectedId]);
+  }, [selectedId, loadDetail]);
 
   const run = runs.find((r) => r.id === selectedId) ?? null;
   const filteredRuns = useMemo(() => {

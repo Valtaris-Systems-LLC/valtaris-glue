@@ -28,6 +28,15 @@ function fmtMs(ms: number) {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+type KnowledgeEntry = {
+  definition_id: string;
+  purpose: string | null;
+  owner: string | null;
+  business_outcome: string | null;
+  known_risks: string | null;
+  operational_notes: string | null;
+};
+
 export default function Reliability() {
   const { user } = useAuth();
   const load = useReliability((s) => s.load);
@@ -61,10 +70,16 @@ export default function Reliability() {
   const persistLiveAnomalies = async () => {
     const tenant = runs[0]?.tenant_id ?? null;
     let n = 0;
+    let failed = 0;
     for (const a of liveAnomalies) {
-      try { await recordAnomaly({ kind: a.kind, severity: a.severity, scope: a.scope, subject: a.subject, metric_value: null, baseline_value: null, explanation: a.explanation, evidence: a.evidence }, tenant); n++; } catch {}
+      try {
+        await recordAnomaly({ kind: a.kind, severity: a.severity, scope: a.scope, subject: a.subject, metric_value: null, baseline_value: null, explanation: a.explanation, evidence: a.evidence }, tenant);
+        n++;
+      } catch {
+        failed++;
+      }
     }
-    toast.success(`Recorded ${n} anomaly event${n === 1 ? "" : "s"}`);
+    toast.success(`Recorded ${n} anomaly event${n === 1 ? "" : "s"}${failed ? ` (${failed} failed)` : ""}`);
   };
 
   return (
@@ -334,7 +349,7 @@ export default function Reliability() {
             knowledge={knowledge}
             onSave={async (input) => {
               try { await saveKnowledge(input); toast.success("Knowledge updated"); }
-              catch (e: any) { toast.error(e.message ?? "Save failed"); }
+              catch (e) { toast.error(e instanceof Error ? e.message : "Save failed"); }
             }}
           />
         </TabsContent>
@@ -380,8 +395,8 @@ export default function Reliability() {
 
 function KnowledgeEditor({ definitions, knowledge, onSave }: {
   definitions: { id: string; name: string; tenant_id: string }[];
-  knowledge: any[];
-  onSave: (k: any) => Promise<void>;
+  knowledge: KnowledgeEntry[];
+  onSave: (k: { definition_id: string; tenant_id: string; purpose: string; owner: string; business_outcome: string; known_risks: string; operational_notes: string }) => Promise<void>;
 }) {
   const [sel, setSel] = useState<string | null>(null);
   const def = definitions.find((d) => d.id === sel);

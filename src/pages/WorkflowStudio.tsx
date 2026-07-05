@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useWorkflowStudio } from "@/store/useWorkflowStudio";
+import { useWorkflowStudio, type WfMigration } from "@/store/useWorkflowStudio";
 import { useAuth } from "@/hooks/useAuth";
 import { supabase } from "@/integrations/supabase/client";
 import { PageHeader } from "@/components/ui/page-header";
@@ -14,6 +14,10 @@ import { DAGEditor } from "@/components/mission/DAGEditor";
 import { WorkflowHealthPanel } from "@/components/mission/WorkflowHealthPanel";
 import { Plus, GitBranch, History, AlertTriangle, RotateCcw, Archive, FileEdit, Workflow } from "lucide-react";
 import { toast } from "sonner";
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Operation failed";
+}
 
 export default function WorkflowStudio() {
   const { user } = useAuth();
@@ -55,7 +59,7 @@ export default function WorkflowStudio() {
               const { data: m } = await supabase.from("tenant_members").select("tenant_id").eq("user_id", user.id).limit(1).maybeSingle();
               if (!m) { toast.error("No tenant membership"); return; }
               try { await createDefinition(m.tenant_id, key, name); toast.success("Workflow created"); }
-              catch (e: any) { toast.error(e.message); }
+              catch (e) { toast.error(getErrorMessage(e)); }
             }} />
           </CardHeader>
           <CardContent className="pt-0">
@@ -119,7 +123,7 @@ export default function WorkflowStudio() {
                         disabled={!selectedVersionId}
                         onClick={async () => {
                           try { await createDraftFromVersion(selectedVersionId!); toast.success("Draft branched"); }
-                          catch (e: any) { toast.error(e.message); }
+                          catch (e) { toast.error(getErrorMessage(e)); }
                         }}>
                         <FileEdit className="h-3 w-3 mr-1.5" />Branch as new draft
                       </Button>
@@ -127,7 +131,7 @@ export default function WorkflowStudio() {
                         disabled={!selectedVersionId || publishedId === selectedVersionId || !publishedId}
                         onClick={async () => {
                           try { await rollback(def.id, selectedVersionId!); toast.success("Rolled back published pointer"); }
-                          catch (e: any) { toast.error(e.message); }
+                          catch (e) { toast.error(getErrorMessage(e)); }
                         }}>
                         <RotateCcw className="h-3 w-3 mr-1.5" />Rollback to selected
                       </Button>
@@ -135,7 +139,7 @@ export default function WorkflowStudio() {
                         disabled={!selectedVersionId || publishedId === selectedVersionId}
                         onClick={async () => {
                           try { await archive(selectedVersionId!); toast.success("Version archived"); }
-                          catch (e: any) { toast.error(e.message); }
+                          catch (e) { toast.error(getErrorMessage(e)); }
                         }}>
                         <Archive className="h-3 w-3 mr-1.5" />Archive selected
                       </Button>
@@ -143,7 +147,7 @@ export default function WorkflowStudio() {
                         disabled={!publishedId || !selectedVersionId || publishedId === selectedVersionId}
                         onClick={async () => {
                           try { await startMigration(def.id, publishedId!, selectedVersionId!, "drain"); toast.success("Drain migration started"); }
-                          catch (e: any) { toast.error(e.message); }
+                          catch (e) { toast.error(getErrorMessage(e)); }
                         }}>
                         <GitBranch className="h-3 w-3 mr-1.5" />Start drain migration
                       </Button>
@@ -151,7 +155,7 @@ export default function WorkflowStudio() {
                     <div className="col-span-4">
                       <div className="text-[10px] uppercase text-muted-foreground mb-2">Recent migrations</div>
                       <ScrollArea className="h-[140px]">
-                        {migrations.filter((m: any) => m.definition_id === def.id).slice(0, 8).map((m: any) => (
+                        {migrations.filter((m: WfMigration) => m.definition_id === def.id).slice(0, 8).map((m: WfMigration) => (
                           <div key={m.id} className="text-[11px] py-1 border-b border-border/50">
                             <div className="flex items-center justify-between">
                               <span className="font-mono">{m.strategy}</span>
@@ -160,7 +164,7 @@ export default function WorkflowStudio() {
                             <div className="text-[10px] text-muted-foreground">{new Date(m.started_at).toLocaleString()}</div>
                           </div>
                         ))}
-                        {migrations.filter((m: any) => m.definition_id === def.id).length === 0 && (
+                        {migrations.filter((m: WfMigration) => m.definition_id === def.id).length === 0 && (
                           <div className="text-[11px] text-muted-foreground">No migrations recorded.</div>
                         )}
                       </ScrollArea>

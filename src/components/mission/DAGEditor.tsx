@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback, MouseEvent } from "react";
-import { useWorkflowStudio, type WfNode, type WfEdge, type WfGraph } from "@/store/useWorkflowStudio";
+import { useWorkflowStudio, type ConnectorSchema, type WfNode, type WfEdge, type WfGraph } from "@/store/useWorkflowStudio";
+import type { Json } from "@/integrations/supabase/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -45,7 +46,7 @@ export function DAGEditor() {
   const dragRef = useRef<{ id: string; offX: number; offY: number } | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
 
-  const graph: WfGraph = draftGraph ?? { nodes: [], edges: [] };
+  const graph = useMemo<WfGraph>(() => draftGraph ?? { nodes: [], edges: [] }, [draftGraph]);
   const selectedNode = graph.nodes.find((n) => n.id === selectedNodeId) ?? null;
 
   const updateGraph = useCallback(
@@ -115,18 +116,38 @@ export function DAGEditor() {
   const updateNode = (id: string, patch: Partial<WfNode>) => {
     updateGraph((g) => ({ ...g, nodes: g.nodes.map((n) => n.id === id ? { ...n, ...patch } : n) }));
   };
-  const updateNodeConfig = (id: string, patch: Record<string, any>) => {
+  const updateNodeConfig = (id: string, patch: Record<string, Json | undefined>) => {
     updateGraph((g) => ({ ...g, nodes: g.nodes.map((n) => n.id === id ? { ...n, config: { ...(n.config ?? {}), ...patch } } : n) }));
   };
 
-  const handleSave = async () => { try { await save(); toast.success("Draft saved"); } catch (e: any) { toast.error(e.message); } };
+  const handleSave = async () => {
+    try {
+      await save();
+      toast.success("Draft saved");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to save draft");
+    }
+  };
   const handleValidate = async () => {
-    try { const r = await validate(); r?.ok ? toast.success("Validation passed") : toast.error(`Validation failed: ${(r?.errors ?? []).length} errors`); }
-    catch (e: any) { toast.error(e.message); }
+    try {
+      const result = await validate();
+      if (result?.ok) {
+        toast.success("Validation passed");
+      } else {
+        const errors = Array.isArray(result?.errors) ? result.errors : [];
+        toast.error(`Validation failed: ${errors.length} errors`);
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Validation failed");
+    }
   };
   const handlePublish = async () => {
-    try { await publish(); toast.success("Workflow published — version frozen"); }
-    catch (e: any) { toast.error(e.message); }
+    try {
+      await publish();
+      toast.success("Workflow published — version frozen");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Publish failed");
+    }
   };
 
   if (!version) return <div className="p-8 text-sm text-muted-foreground">Select a workflow definition to begin authoring.</div>;
@@ -198,7 +219,11 @@ export function DAGEditor() {
                   <span className="font-mono text-[10px] uppercase opacity-70">{n.type}</span>
                   {isDraft && (
                     <button className="text-[10px] hover:text-primary"
-                      onClick={(ev) => { ev.stopPropagation(); edgeFrom === n.id ? setEdgeFrom(null) : startEdge(n.id); }}>
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        if (edgeFrom === n.id) setEdgeFrom(null);
+                        else startEdge(n.id);
+                      }}>
                       {edgeFrom === n.id ? "•cancel" : "→wire"}
                     </button>
                   )}
@@ -235,8 +260,17 @@ export function DAGEditor() {
   );
 }
 
-function NodeInspector({ node, schemas, disabled, onUpdate, onUpdateConfig, onDelete }: any) {
-  const schema = schemas.find((s: any) => s.connector === node.config?.connector);
+type NodeInspectorProps = {
+  node: WfNode;
+  schemas: ConnectorSchema[];
+  disabled: boolean;
+  onUpdate: (patch: Partial<WfNode>) => void;
+  onUpdateConfig: (patch: Record<string, Json | undefined>) => void;
+  onDelete: () => void;
+};
+
+function NodeInspector({ node, schemas, disabled, onUpdate, onUpdateConfig, onDelete }: NodeInspectorProps) {
+  const schema = schemas.find((s) => s.connector === node.config?.connector);
   return (
     <div className="space-y-3 text-xs">
       <div>
@@ -258,7 +292,7 @@ function NodeInspector({ node, schemas, disabled, onUpdate, onUpdateConfig, onDe
             <Select value={node.config?.connector ?? ""} disabled={disabled} onValueChange={(v) => onUpdateConfig({ connector: v, action: undefined })}>
               <SelectTrigger className="h-7 text-xs"><SelectValue placeholder="select" /></SelectTrigger>
               <SelectContent>
-                {schemas.map((s: any) => <SelectItem key={s.connector} value={s.connector}>{s.connector}</SelectItem>)}
+                {schemas.map((s) => <SelectItem key={s.connector} value={s.connector}>{s.connector}</SelectItem>)}
               </SelectContent>
             </Select>
           </div>
@@ -305,7 +339,13 @@ function NodeInspector({ node, schemas, disabled, onUpdate, onUpdateConfig, onDe
       <div>
         <Label className="text-[10px] uppercase">Raw Config (JSON)</Label>
         <Textarea rows={4} disabled={disabled} value={JSON.stringify(node.config ?? {}, null, 2)}
-          onChange={(e) => { try { onUpdate({ config: JSON.parse(e.target.value) }); } catch { /* ignore */ } }}
+          onChange={(e) => {
+            try {
+              onUpdate({ config: JSON.parse(e.target.value) as Record<string, Json | undefined> });
+            } catch {
+              // ignore invalid JSON while typing
+            }
+          }}
           className="text-[10px] font-mono" />
       </div>
       <Button size="sm" variant="destructive" disabled={disabled} onClick={onDelete} className="w-full">
@@ -315,7 +355,14 @@ function NodeInspector({ node, schemas, disabled, onUpdate, onUpdateConfig, onDe
   );
 }
 
-function EdgeInspector({ edge, disabled, onUpdate, onDelete }: any) {
+type EdgeInspectorProps = {
+  edge: WfEdge;
+  disabled: boolean;
+  onUpdate: (patch: Partial<WfEdge>) => void;
+  onDelete: () => void;
+};
+
+function EdgeInspector({ edge, disabled, onUpdate, onDelete }: EdgeInspectorProps) {
   return (
     <div className="space-y-3 text-xs">
       <div className="font-mono text-[11px] text-muted-foreground">{edge.from} → {edge.to}</div>

@@ -17,6 +17,14 @@ function json(body: unknown, status = 200) {
   });
 }
 
+type CreateDefinitionPayload = { tenant_id?: string; key?: string; name?: string };
+type SaveDraftPayload = { version_id?: string; graph?: Record<string, unknown>; metadata?: Record<string, unknown> };
+type VersionIdPayload = { version_id?: string };
+type RollbackPayload = { definition_id?: string; target_version_id?: string };
+type DraftFromVersionPayload = { source_version_id?: string };
+type StartMigrationPayload = { definition_id?: string; from_version_id?: string; to_version_id?: string; strategy?: string };
+type CompleteMigrationPayload = { migration_id?: string; report?: Record<string, unknown> };
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
@@ -38,7 +46,7 @@ Deno.serve(async (req) => {
   try {
     switch (action) {
       case "create_definition": {
-        const { tenant_id, key, name } = payload as any;
+        const { tenant_id, key, name } = payload as CreateDefinitionPayload;
         if (!tenant_id || !key || !name) return json({ error: "tenant_id, key, name required" }, 400);
         const { data, error } = await userClient.rpc("create_workflow_definition", {
           _tenant_id: tenant_id, _key: key, _name: name, _operator_uid: operator_uid,
@@ -48,7 +56,7 @@ Deno.serve(async (req) => {
       }
 
       case "save_draft": {
-        const { version_id, graph, metadata } = payload as any;
+        const { version_id, graph, metadata } = payload as SaveDraftPayload;
         if (!version_id || !graph) return json({ error: "version_id and graph required" }, 400);
         const { data: v } = await userClient.from("workflow_versions").select("state").eq("id", version_id).maybeSingle();
         if (!v) return json({ error: "version not found" }, 404);
@@ -61,14 +69,14 @@ Deno.serve(async (req) => {
       }
 
       case "validate": {
-        const { version_id } = payload as any;
+        const { version_id } = payload as VersionIdPayload;
         const { data, error } = await userClient.rpc("validate_workflow_version", { _version_id: version_id });
         if (error) throw error;
         return json(data);
       }
 
       case "publish": {
-        const { version_id } = payload as any;
+        const { version_id } = payload as VersionIdPayload;
         const { data, error } = await userClient.rpc("publish_workflow_version", {
           _version_id: version_id, _operator_uid: operator_uid,
         });
@@ -79,7 +87,7 @@ Deno.serve(async (req) => {
       }
 
       case "archive": {
-        const { version_id } = payload as any;
+        const { version_id } = payload as VersionIdPayload;
         const { error } = await userClient.rpc("archive_workflow_version", {
           _version_id: version_id, _operator_uid: operator_uid,
         });
@@ -88,7 +96,7 @@ Deno.serve(async (req) => {
       }
 
       case "rollback": {
-        const { definition_id, target_version_id } = payload as any;
+        const { definition_id, target_version_id } = payload as RollbackPayload;
         const { error } = await userClient.rpc("rollback_published_version", {
           _definition_id: definition_id,
           _target_version_id: target_version_id,
@@ -99,7 +107,7 @@ Deno.serve(async (req) => {
       }
 
       case "create_draft_from_version": {
-        const { source_version_id } = payload as any;
+        const { source_version_id } = payload as DraftFromVersionPayload;
         const { data, error } = await userClient.rpc("create_draft_from_version", {
           _source_version_id: source_version_id, _operator_uid: operator_uid,
         });
@@ -108,7 +116,7 @@ Deno.serve(async (req) => {
       }
 
       case "start_migration": {
-        const { definition_id, from_version_id, to_version_id, strategy } = payload as any;
+        const { definition_id, from_version_id, to_version_id, strategy } = payload as StartMigrationPayload;
         const { data: def } = await userClient.from("workflow_definitions").select("tenant_id").eq("id", definition_id).maybeSingle();
         if (!def) return json({ error: "definition not found" }, 404);
         const { data, error } = await userClient.from("workflow_migrations").insert({
@@ -126,7 +134,7 @@ Deno.serve(async (req) => {
       }
 
       case "complete_migration": {
-        const { migration_id, report } = payload as any;
+        const { migration_id, report } = payload as CompleteMigrationPayload;
         const { data: m } = await userClient.from("workflow_migrations").select("tenant_id").eq("id", migration_id).maybeSingle();
         if (!m) return json({ error: "migration not found" }, 404);
         const { error } = await userClient.from("workflow_migrations").update({

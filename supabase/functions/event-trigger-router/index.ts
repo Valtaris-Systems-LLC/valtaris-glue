@@ -21,7 +21,7 @@ function authorized(req: Request): boolean {
 /** Tiny condition evaluator: every key in cond must equal payload[key]. */
 function matches(cond: Record<string, unknown>, payload: Record<string, unknown>): boolean {
   for (const [k, v] of Object.entries(cond ?? {})) {
-    if ((payload as any)?.[k] !== v) return false;
+    if (payload[k] !== v) return false;
   }
   return true;
 }
@@ -59,7 +59,7 @@ Deno.serve(async (req) => {
       fired.push({ trigger_id: t.id, ok: false, reason: "max_depth" });
       continue;
     }
-    if (!matches((t.condition as any) ?? {}, payload ?? {})) {
+    if (!matches((t.condition as Record<string, unknown> | null) ?? {}, (payload as Record<string, unknown> | null) ?? {})) {
       fired.push({ trigger_id: t.id, ok: false, reason: "condition_unmet" });
       continue;
     }

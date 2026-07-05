@@ -5,6 +5,16 @@ import { Badge } from "@/components/ui/badge";
 import { Activity, AlertTriangle, CheckCircle2, GitMerge, Plug, ShieldAlert } from "lucide-react";
 
 type Finding = { level: "ok" | "warn" | "error"; code: string; message: string };
+type CountKey = "connector" | "approval" | "rollback" | "parallel" | "branch";
+type CountMap = Record<CountKey, number>;
+
+function getConfigValue(config: WfGraph["nodes"][number]["config"], key: string) {
+  return typeof config?.[key] === "string" ? config[key] : undefined;
+}
+
+function hasConfigArray(config: WfGraph["nodes"][number]["config"], key: string) {
+  return Array.isArray(config?.[key]) && config[key].length > 0;
+}
 
 function analyze(graph: WfGraph, knownConnectors: Set<string>): { score: number; findings: Finding[] } {
   const findings: Finding[] = [];
@@ -56,14 +66,14 @@ function analyze(graph: WfGraph, knownConnectors: Set<string>): { score: number;
   // Missing connector / config
   for (const n of graph.nodes) {
     if (n.type === "connector") {
-      const conn = (n.config as any)?.connector || (n.config as any)?.adapter;
+      const conn = getConfigValue(n.config, "connector") ?? getConfigValue(n.config, "adapter");
       if (!conn) findings.push({ level: "error", code: "no_connector", message: `Connector node "${n.label || n.id}" has no adapter selected.` });
       else if (knownConnectors.size && !knownConnectors.has(conn)) {
         findings.push({ level: "warn", code: "unknown_connector", message: `Adapter "${conn}" not in registered schemas.` });
       }
       if (!(n.retry?.max ?? 0)) findings.push({ level: "warn", code: "no_retry", message: `Node "${n.label || n.id}" has no retry policy.` });
     }
-    if (n.type === "approval" && !(n.config as any)?.approvers) {
+    if (n.type === "approval" && !hasConfigArray(n.config, "approvers")) {
       findings.push({ level: "warn", code: "no_approvers", message: `Approval gate "${n.label || n.id}" has no approver group.` });
     }
   }
@@ -97,9 +107,9 @@ export function WorkflowHealthPanel() {
   const tone = scoreTone(analysis.score);
 
   const counts = useMemo(() => {
-    const c = { connector: 0, approval: 0, rollback: 0, parallel: 0, branch: 0 };
+    const c: CountMap = { connector: 0, approval: 0, rollback: 0, parallel: 0, branch: 0 };
     for (const n of draftGraph?.nodes ?? []) {
-      if (n.type in c) (c as any)[n.type]++;
+      if (n.type in c) c[n.type as CountKey]++;
     }
     return c;
   }, [draftGraph]);
@@ -122,10 +132,10 @@ export function WorkflowHealthPanel() {
             { k: "rollback", icon: GitMerge, label: "Rollback" },
             { k: "parallel", icon: Activity, label: "Parallel" },
             { k: "branch", icon: GitMerge, label: "Branch" },
-          ].map(({ k, icon: Icon, label }) => (
+          ].map(({ k, icon: Icon, label }: { k: CountKey; icon: typeof Plug; label: string }) => (
             <div key={k} className="rounded border border-border bg-muted/30 py-2">
               <Icon className="h-3 w-3 mx-auto text-muted-foreground" />
-              <div className="font-mono text-sm tabular-nums mt-1">{(counts as any)[k]}</div>
+              <div className="font-mono text-sm tabular-nums mt-1">{counts[k]}</div>
               <div className="text-[9px] uppercase tracking-wider text-muted-foreground">{label}</div>
             </div>
           ))}

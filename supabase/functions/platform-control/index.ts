@@ -13,13 +13,21 @@ type Action =
 const json = (b: unknown, s = 200) =>
   new Response(JSON.stringify(b), { status: s, headers: { ...corsHeaders, "Content-Type": "application/json" } });
 
+type TemplateVersionRow = {
+  id: string;
+  version: number;
+  graph: Record<string, unknown>;
+  required_connectors?: string[] | null;
+};
+type ValidationCheck = { name: string; ok: boolean; level: "pass" | "fail" | "warn"; detail: unknown };
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   const auth = await requireUser(req);
   if (!auth.ok) return json({ error: auth.error }, auth.status);
   const operator_uid = auth.ctx.userId;
 
-  let body: any;
+  let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
   const action: Action = body.action;
   if (!action) return json({ error: "action required" }, 400);
@@ -40,25 +48,25 @@ Deno.serve(async (req) => {
           .select("id, name").eq("key", template_key).maybeSingle();
         if (te || !tmpl) return json({ error: "template not found" }, 404);
 
-        let ver: any;
+        let ver: TemplateVersionRow | null = null;
         if (version) {
           const r = await user.from("template_versions")
             .select("id, version, graph, required_connectors")
             .eq("template_id", tmpl.id).eq("version", version).maybeSingle();
-          ver = r.data;
+          ver = r.data as TemplateVersionRow | null;
         } else {
           const r = await user.from("template_versions")
             .select("id, version, graph, required_connectors")
             .eq("template_id", tmpl.id).eq("state", "published")
             .order("version", { ascending: false }).limit(1).maybeSingle();
-          ver = r.data;
+          ver = r.data as TemplateVersionRow | null;
           if (!ver) {
             // bootstrap an initial published version on first install so templates remain installable
             const { data: nv } = await svc.from("template_versions").insert({
               template_id: tmpl.id, version: 1, state: "published",
               graph: { nodes: [], edges: [] }, published_at: new Date().toISOString(),
             }).select("id, version, graph, required_connectors").single();
-            ver = nv;
+            ver = nv as TemplateVersionRow;
           }
         }
 
@@ -68,7 +76,7 @@ Deno.serve(async (req) => {
         }).select("id").single();
         if (ie) throw ie;
 
-        await svc.from("workflow_templates").update({ install_count: (tmpl as any).install_count + 1 ?? 1 })
+        await svc.from("workflow_templates").update({ install_count: (tmpl.install_count ?? 0) + 1 })
           .eq("id", tmpl.id);
         await svc.from("runtime_audit_log").insert({
           tenant_id, actor: operator_uid, action: "template.install",
@@ -131,7 +139,7 @@ Deno.serve(async (req) => {
         const reqConns: string[] = manifest.connector_keys ?? [];
         const { data: avail } = await svc.from("connector_catalog")
           .select("key").in("key", reqConns.length ? reqConns : ["__none__"]);
-        const availKeys = new Set((avail ?? []).map((r: any) => r.key));
+        const availKeys = new Set((avail ?? []).map((r) => r.key));
         const missing = reqConns.filter((k) => !availKeys.has(k));
 
         const state = missing.length ? "failed" : "imported";
@@ -148,10 +156,10 @@ Deno.serve(async (req) => {
 
       case "validate_deployment": {
         const { tenant_id, profile_id } = body;
-        const checks: any[] = [];
+        const checks: ValidationCheck[] = [];
         let passed = 0, failed = 0, warnings = 0;
 
-        const push = (name: string, ok: boolean, detail?: any, level: "fail" | "warn" = "fail") => {
+        const push = (name: string, ok: boolean, detail?: unknown, level: "fail" | "warn" = "fail") => {
           checks.push({ name, ok, level: ok ? "pass" : level, detail: detail ?? null });
           if (ok) passed++; else if (level === "warn") warnings++; else failed++;
         };
@@ -167,7 +175,7 @@ Deno.serve(async (req) => {
         push("connectors.configured", (connectorCount ?? 0) > 0, { count: connectorCount });
         push("webhooks.registered", (webhookCount ?? 0) > 0, { count: webhookCount }, "warn");
         push("workflows.defined", (wfCount ?? 0) > 0, { count: wfCount });
-        push("breakers.healthy", !(breakers && breakers.length), { open: breakers?.map((b: any) => b.connector) ?? [] });
+        push("breakers.healthy", !(breakers && breakers.length), { open: breakers?.map((b) => b.connector) ?? [] });
         push("workers.active", (workerCount ?? 0) > 0, { count: workerCount });
 
         const state = failed > 0 ? "failed" : warnings > 0 ? "passed_with_warnings" : "passed";

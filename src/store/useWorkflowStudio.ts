@@ -4,7 +4,7 @@ import type { Json } from "@/integrations/supabase/types";
 
 type JsonRecord = Record<string, Json | undefined>;
 type WfValidation = { ok: boolean; errors?: string[]; warnings?: string[] } | null;
-type WfMigration = {
+export type WfMigration = {
   id: string;
   definition_id: string;
   strategy: string;

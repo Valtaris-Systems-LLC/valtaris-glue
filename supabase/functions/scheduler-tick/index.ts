@@ -20,7 +20,7 @@ Deno.serve(async (req) => {
   if (error) return j({ error: error.message }, 500);
 
   const fired: Array<{ schedule_id: string; run_id?: string; ok: boolean; error?: string }> = [];
-  for (const s of (due ?? []) as Array<Record<string, any>>) {
+  for (const s of (due ?? []) as Array<Record<string, unknown>>) {
     const result = await enqueueFromTrigger(sb, {
       tenant_id: s.tenant_id,
       dag_id: s.dag_id,

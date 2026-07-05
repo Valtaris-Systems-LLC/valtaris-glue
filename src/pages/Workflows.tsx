@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useApiStore, Workflow, WorkflowStep } from '@/store/useApiStore';
+import type { Json } from '@/integrations/supabase/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -30,8 +31,8 @@ function StepEditor({ workflowId, step, index }: { workflowId: string; step: Wor
       const parsed = text.trim() ? JSON.parse(text) : {};
       updateData(workflowId, step.id, parsed);
       setErr(null);
-    } catch (e: any) {
-      setErr(e.message);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Invalid JSON');
     }
   };
 
@@ -71,7 +72,7 @@ function StepEditor({ workflowId, step, index }: { workflowId: string; step: Wor
 
     // Merge fileUrl into the step's JSON input. The runner mirrors these fields
     // onto context[i].output so downstream steps can use {{N.output.fileUrl}}.
-    let current: Record<string, any> = {};
+    let current: Record<string, Json | undefined> = {};
     try { current = text.trim() ? JSON.parse(text) : {}; } catch { current = {}; }
     const next = {
       ...current,
@@ -315,6 +316,15 @@ interface RunRow {
   finished_at: string | null;
 }
 
+type RunStep = {
+  status?: string;
+  success?: boolean;
+  service: string;
+  action: string;
+  attempts?: number;
+  duration_ms?: number | null;
+};
+
 function RunHistory() {
   const { user } = useAuth();
   const [runs, setRuns] = useState<RunRow[]>([]);
@@ -322,11 +332,11 @@ function RunHistory() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(false);
   const [statusFilter, setStatusFilter] = useState<'all' | 'completed' | 'failed' | 'running'>('all');
-  const [expandedSteps, setExpandedSteps] = useState<Record<string, any[]>>({});
+  const [expandedSteps, setExpandedSteps] = useState<Record<string, RunStep[]>>({});
 
   // Build a base query with the active filter — selects only list-grade columns.
   // step_count uses jsonb_array_length so we don't pull the whole steps blob.
-  const buildQuery = () => {
+  const buildQuery = useCallback(() => {
     let q = supabase
       .from('workflow_runs')
       .select('id, workflow_name, status, duration_ms, error, started_at, finished_at, step_count:steps')
@@ -334,29 +344,29 @@ function RunHistory() {
       .limit(PAGE_SIZE);
     if (statusFilter !== 'all') q = q.eq('status', statusFilter);
     return q;
-  };
+  }, [statusFilter]);
 
   // Map raw rows: replace the steps payload with its length so the list stays light.
-  const mapRows = (rows: any[]): RunRow[] =>
+  const mapRows = useCallback((rows: Array<RunRow & { step_count: Json | null }>): RunRow[] =>
     rows.map(r => ({
       ...r,
       step_count: Array.isArray(r.step_count) ? r.step_count.length : null,
-    }));
+    })), []);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     if (!user) return;
     setLoading(true);
     setExpandedSteps({});
     const { data } = await buildQuery();
-    const mapped = mapRows(data ?? []);
+    const mapped = mapRows((data ?? []) as Array<RunRow & { step_count: Json | null }>);
     setRuns(mapped);
     setHasMore(mapped.length === PAGE_SIZE);
     setLoading(false);
-  };
+  }, [buildQuery, mapRows, user]);
 
   // Keyset pagination using started_at as the cursor — fast even with many rows
   // thanks to the (user_id, started_at DESC) index.
-  const loadMore = async () => {
+  const loadMore = useCallback(async () => {
     if (!user || runs.length === 0) return;
     setLoadingMore(true);
     const cursor = runs[runs.length - 1].started_at;
@@ -368,32 +378,31 @@ function RunHistory() {
       .limit(PAGE_SIZE);
     if (statusFilter !== 'all') q = q.eq('status', statusFilter);
     const { data } = await q;
-    const mapped = mapRows(data ?? []);
+    const mapped = mapRows((data ?? []) as Array<RunRow & { step_count: Json | null }>);
     setRuns(prev => [...prev, ...mapped]);
     setHasMore(mapped.length === PAGE_SIZE);
     setLoadingMore(false);
-  };
+  }, [mapRows, runs, statusFilter, user]);
 
   // Lazy-fetch the heavy steps payload when a row is expanded
-  const fetchSteps = async (runId: string) => {
+  const fetchSteps = useCallback(async (runId: string) => {
     if (expandedSteps[runId]) return;
     const { data } = await supabase
       .from('workflow_runs')
       .select('steps')
       .eq('id', runId)
       .single();
-    setExpandedSteps(prev => ({ ...prev, [runId]: Array.isArray(data?.steps) ? (data!.steps as any[]) : [] }));
-  };
+    setExpandedSteps(prev => ({ ...prev, [runId]: Array.isArray(data?.steps) ? (data.steps as RunStep[]) : [] }));
+  }, [expandedSteps]);
 
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [user, statusFilter]);
+  useEffect(() => { void load(); }, [load]);
 
   const workflowsRunning = useApiStore(s => s.workflows.some(w => w.status === 'running'));
   useEffect(() => {
     if (!workflowsRunning) return;
     const interval = setInterval(load, 2000);
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workflowsRunning, statusFilter]);
+  }, [load, workflowsRunning]);
 
   return (
     <div className="glass-panel p-5">
@@ -403,7 +412,7 @@ function RunHistory() {
           <h3 className="font-display font-semibold text-foreground">Run History</h3>
         </div>
         <div className="flex items-center gap-2">
-          <Select value={statusFilter} onValueChange={(v: any) => setStatusFilter(v)}>
+          <Select value={statusFilter} onValueChange={(v: 'all' | 'completed' | 'failed' | 'running') => setStatusFilter(v)}>
             <SelectTrigger className="h-7 w-[120px] font-mono text-[11px] bg-muted border-border/50">
               <SelectValue />
             </SelectTrigger>
@@ -456,7 +465,7 @@ function RunHistory() {
                     ) : steps.length === 0 ? (
                       <p className="text-[10px] font-mono text-muted-foreground">No step details.</p>
                     ) : (
-                      steps.map((s: any, i: number) => (
+                      steps.map((s, i: number) => (
                         <div key={i} className="text-[10px] font-mono">
                           <div className="flex items-center gap-2">
                             {s.status === 'skipped'
@@ -640,4 +649,3 @@ export default function Workflows() {
     </div>
   );
 }
-
