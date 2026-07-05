@@ -1,21 +1,21 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '@/integrations/supabase/client';
+import type { Database, Json } from '@/integrations/supabase/types';
 import { useApiStore } from '@/store/useApiStore';
 import { CheckCircle, XCircle, FlaskConical, RotateCcw, Bookmark } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/hooks/use-toast';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
-interface ApiRequest {
-  id: string;
-  service: string;
-  action: string;
+type ApiRequest = Database['public']['Tables']['api_requests']['Row'] & {
   request_data: Record<string, unknown>;
   response_data: Record<string, unknown>;
-  success: boolean;
-  mock: boolean;
-  duration_ms: number | null;
-  created_at: string;
+};
+
+type ApiRequestInsert = Database['public']['Tables']['api_requests']['Insert'];
+
+function toRecord(value: Json | null): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 export function ExecutionHistory() {
@@ -32,7 +32,13 @@ export function ExecutionHistory() {
       .order('created_at', { ascending: false })
       .limit(50);
 
-    if (!error && data) setHistory(data as ApiRequest[]);
+    if (!error && data) {
+      setHistory(data.map((item) => ({
+        ...item,
+        request_data: toRecord(item.request_data),
+        response_data: toRecord(item.response_data),
+      })));
+    }
     setLoading(false);
   };
 
@@ -51,15 +57,16 @@ export function ExecutionHistory() {
   };
 
   const handleSave = async (item: ApiRequest) => {
-    const { error } = await supabase.from('api_requests').insert([{
+    const payload: ApiRequestInsert = {
       service: item.service,
       action: item.action,
-      request_data: item.request_data as any,
-      response_data: {} as any,
+      request_data: item.request_data,
+      response_data: {},
       success: false,
       mock: false,
       duration_ms: null,
-    }]);
+    };
+    const { error } = await supabase.from('api_requests').insert([payload]);
     if (error) {
       toast({ title: 'Failed to save', description: error.message, variant: 'destructive' });
     } else {

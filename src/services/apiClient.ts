@@ -4,7 +4,7 @@ import { useApiStore } from '@/store/useApiStore';
  * All API calls are routed through the backend edge function.
  * No direct external API calls from the frontend.
  */
-export async function executeApi(serviceAction: string, data: any = {}) {
+export async function executeApi(serviceAction: string, data: Record<string, unknown> = {}) {
   return useApiStore.getState().execute(serviceAction, data);
 }
 

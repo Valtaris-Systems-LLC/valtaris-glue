@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { supabase } from '@/integrations/supabase/client';
+import type { Json } from '@/integrations/supabase/types';
 import {
   demoWorkflows,
   demoRuns,
@@ -32,7 +33,7 @@ export interface LogEntry {
   serviceAction: string;
   status: 'success' | 'error' | 'pending';
   duration?: number;
-  data?: any;
+  data?: Json;
   error?: string;
 }
 
@@ -49,13 +50,22 @@ export interface WorkflowStep {
   id: string;
   service: string;
   action: string;
-  data: Record<string, any>;
+  data: Record<string, Json | undefined>;
   status: 'pending' | 'success' | 'error' | 'skipped' | 'idle';
-  result?: any;
+  result?: ExecutionResult;
   // Per-step retry/recovery configuration
   maxRetries?: number;        // total attempts beyond the first try; default 0
   retryDelayMs?: number;      // base delay; doubles each retry; default 500
   onError?: 'stop' | 'continue' | 'skip'; // what to do if step ultimately fails; default 'stop'
+}
+
+export interface ExecutionResult {
+  success: boolean;
+  error?: string;
+  data?: Json;
+  duration?: number;
+  input?: Json;
+  output?: Record<string, Json | undefined>;
 }
 
 interface ApiState {
@@ -64,7 +74,7 @@ interface ApiState {
   workflows: Workflow[];
   selectedService: string | null;
   selectedAction: string | null;
-  response: any | null;
+  response: ExecutionResult | null;
   loading: boolean;
 
   // Demo / operational surfaces
@@ -79,7 +89,7 @@ interface ApiState {
 
   connect: (serviceName: string) => { success: boolean; error?: string };
   disconnect: (serviceName: string) => void;
-  execute: (serviceAction: string, data: any) => Promise<any>;
+  execute: (serviceAction: string, data: Record<string, Json | undefined>) => Promise<ExecutionResult>;
   setSelectedService: (service: string | null) => void;
   setSelectedAction: (action: string | null) => void;
   clearResponse: () => void;
@@ -87,15 +97,15 @@ interface ApiState {
   addWorkflow: (name: string) => string;
   addWorkflowStep: (workflowId: string, step: Omit<WorkflowStep, 'id' | 'status'>) => void;
   removeWorkflowStep: (workflowId: string, stepId: string) => void;
-  updateWorkflowStepData: (workflowId: string, stepId: string, data: Record<string, any>) => void;
+  updateWorkflowStepData: (workflowId: string, stepId: string, data: Record<string, Json | undefined>) => void;
   updateWorkflowStepRetry: (workflowId: string, stepId: string, cfg: { maxRetries?: number; retryDelayMs?: number; onError?: 'stop' | 'continue' | 'skip' }) => void;
-  runWorkflow: (workflowId: string, opts?: { resumeFromIndex?: number; previousContext?: Record<string, any> }) => Promise<void>;
+  runWorkflow: (workflowId: string, opts?: { resumeFromIndex?: number; previousContext?: Record<string, ExecutionResult> }) => Promise<void>;
   retryWorkflowFromFailed: (workflowId: string) => Promise<void>;
   deleteWorkflow: (workflowId: string) => void;
 }
 
 // Resolve placeholders like {{1.output.id}} or {{0.output.text}} from prior step results
-function interpolate(value: any, context: Record<string, any>): any {
+function interpolate(value: Json, context: Record<string, ExecutionResult>): Json {
   if (typeof value === 'string') {
     // If the entire string is a single placeholder, return the raw resolved value (preserves type)
     const single = value.match(/^\{\{\s*([^}]+?)\s*\}\}$/);
@@ -107,15 +117,18 @@ function interpolate(value: any, context: Record<string, any>): any {
   }
   if (Array.isArray(value)) return value.map(v => interpolate(v, context));
   if (value && typeof value === 'object') {
-    const out: Record<string, any> = {};
+    const out: Record<string, Json | undefined> = {};
     for (const k of Object.keys(value)) out[k] = interpolate(value[k], context);
     return out;
   }
   return value;
 }
 
-function resolvePath(obj: any, path: string): any {
-  return path.split('.').reduce((acc, key) => (acc == null ? undefined : acc[key]), obj);
+function resolvePath(obj: unknown, path: string): Json | undefined {
+  return path.split('.').reduce<unknown>((acc, key) => {
+    if (acc == null || typeof acc !== 'object') return undefined;
+    return (acc as Record<string, unknown>)[key];
+  }, obj) as Json | undefined;
 }
 
 export const useApiStore = create<ApiState>((set, get) => ({
@@ -208,7 +221,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
     }));
 
     const start = performance.now();
-    let result: any;
+    let result: ExecutionResult;
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -221,8 +234,8 @@ export const useApiStore = create<ApiState>((set, get) => ({
       } else {
         result = respData;
       }
-    } catch (err: any) {
-      result = { success: false, error: err.message };
+    } catch (err) {
+      result = { success: false, error: err instanceof Error ? err.message : 'Unknown error' };
     }
 
     const duration = Math.round(performance.now() - start);
@@ -332,8 +345,8 @@ export const useApiStore = create<ApiState>((set, get) => ({
       ),
     }));
 
-    const context: Record<string, any> = { ...(opts?.previousContext ?? {}) };
-    const stepResults: any[] = [];
+    const context: Record<string, ExecutionResult> = { ...(opts?.previousContext ?? {}) };
+    const stepResults: Array<Record<string, Json | undefined>> = [];
     let finalStatus: 'completed' | 'failed' = 'completed';
     let runError: string | null = null;
 
@@ -344,8 +357,8 @@ export const useApiStore = create<ApiState>((set, get) => ({
       const onError = step.onError ?? 'stop';
 
       let attempt = 0;
-      let result: any;
-      let resolvedData: any;
+      let result: ExecutionResult;
+      let resolvedData: Json;
       while (true) {
         resolvedData = interpolate(step.data, context);
         const serviceAction = `${step.service}.${step.action}`;
@@ -356,13 +369,16 @@ export const useApiStore = create<ApiState>((set, get) => ({
         await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, attempt - 1)));
       }
 
-      const fileFields: Record<string, any> = {};
+      const fileFields: Record<string, Json | undefined> = {};
       if (resolvedData && typeof resolvedData === 'object') {
         for (const k of ['fileUrl', 'filePath', 'fileName', 'fileType', 'fileSize']) {
-          if ((resolvedData as any)[k] !== undefined) fileFields[k] = (resolvedData as any)[k];
+          if (!Array.isArray(resolvedData) && resolvedData[k] !== undefined) fileFields[k] = resolvedData[k];
         }
       }
-      const output = { ...fileFields, ...(result?.data && typeof result.data === 'object' ? result.data : {}) };
+      const output = {
+        ...fileFields,
+        ...(result.data && typeof result.data === 'object' && !Array.isArray(result.data) ? result.data : {}),
+      };
 
       context[i] = { ...result, input: resolvedData, output };
 
@@ -436,7 +452,7 @@ export const useApiStore = create<ApiState>((set, get) => ({
     const failedIndex = workflow.steps.findIndex(s => s.status === 'error');
     const startIndex = failedIndex === -1 ? 0 : failedIndex;
     // Rebuild a context from prior successful steps' results
-    const previousContext: Record<string, any> = {};
+    const previousContext: Record<string, ExecutionResult> = {};
     for (let i = 0; i < startIndex; i++) {
       const r = workflow.steps[i].result;
       if (r) previousContext[i] = r;

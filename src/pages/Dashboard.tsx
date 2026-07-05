@@ -27,7 +27,7 @@ import { SecurityEventsFeed } from '@/components/mission/SecurityEventsFeed';
 import { ActivationPanel } from '@/components/mission/ActivationPanel';
 import { ScaleInfrastructurePanel } from '@/components/mission/ScaleInfrastructurePanel';
 
-const healthTone = (status: string) =>
+const healthTone = (status: string): 'success' | 'warning' | 'info' | 'danger' =>
   status === 'healthy' ? 'success'
   : status === 'degraded' ? 'warning'
   : status === 'retrying' ? 'info'
@@ -182,7 +182,7 @@ export default function Dashboard() {
               <li key={h.connector} className="rounded-md border border-border bg-muted/30 p-3 space-y-1.5">
                 <div className="flex items-center justify-between">
                   <span className="text-sm font-medium text-foreground capitalize">{h.connector}</span>
-                  <StatusBadge tone={healthTone(h.status) as any} dot>{h.status}</StatusBadge>
+                  <StatusBadge tone={healthTone(h.status)} dot>{h.status}</StatusBadge>
                 </div>
                 <div className="text-[11px] font-mono text-muted-foreground tabular-nums">
                   latency {h.latencyMs != null ? `${h.latencyMs}ms` : '—'} · failures {Math.round(h.failureRate * 100)}%

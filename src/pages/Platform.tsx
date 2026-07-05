@@ -18,6 +18,11 @@ import {
   Search, Package, Boxes,
 } from "lucide-react";
 
+type DeploymentCheck = {
+  name: string;
+  ok: boolean;
+};
+
 export default function Platform() {
   const nav = useNavigate();
   const { user, loading } = useAuth();
@@ -227,7 +232,7 @@ export default function Platform() {
                     {v.passed} passed · {v.failed} failed · {v.warnings} warnings
                   </div>
                   <div className="space-y-1">
-                    {(v.checks as any[]).map((c, i) => (
+                    {(v.checks as DeploymentCheck[]).map((c, i) => (
                       <div key={i} className="text-xs flex items-center gap-2">
                         {c.ok
                           ? <CheckCircle2 className="h-3 w-3 text-success" />

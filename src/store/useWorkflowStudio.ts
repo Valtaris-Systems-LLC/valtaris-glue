@@ -1,12 +1,29 @@
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import type { Json } from "@/integrations/supabase/types";
+
+type JsonRecord = Record<string, Json | undefined>;
+type WfValidation = { ok: boolean; errors?: string[]; warnings?: string[] } | null;
+type WfMigration = {
+  id: string;
+  definition_id: string;
+  strategy: string;
+  state: string;
+  started_at: string;
+};
+type WorkflowInvokeResult = Record<string, unknown> & {
+  error?: string;
+  version_id?: string | null;
+  definition_id?: string | null;
+  migration_id?: string | null;
+};
 
 export type WfNode = {
   id: string;
   type: "start" | "end" | "connector" | "approval" | "rollback" | "trigger" | "ai" | "branch" | "parallel" | "task";
   label: string;
   position: { x: number; y: number };
-  config?: Record<string, any>;
+  config?: JsonRecord;
   retry?: { max: number; backoff_ms: number };
 };
 export type WfEdge = { id: string; from: string; to: string; condition?: string };
@@ -19,19 +36,19 @@ export type WfDefinition = {
 export type WfVersion = {
   id: string; definition_id: string; tenant_id: string; version: number;
   state: "draft" | "published" | "archived" | "deprecated";
-  graph: WfGraph; metadata: Record<string, any>; validation: any;
+  graph: WfGraph; metadata: JsonRecord; validation: WfValidation;
   created_at: string; published_at: string | null; parent_version_id: string | null;
 };
 export type ConnectorSchema = {
   connector: string; version: number; capabilities: string[];
-  input_schema: any; output_schema: any; description: string;
+  input_schema: Json; output_schema: Json; description: string;
 };
 
 interface State {
   definitions: WfDefinition[];
   versions: WfVersion[];
   publishedMap: Record<string, string>; // definition_id -> version_id
-  migrations: any[];
+  migrations: WfMigration[];
   schemas: ConnectorSchema[];
   selectedDefinitionId: string | null;
   selectedVersionId: string | null;
@@ -43,8 +60,8 @@ interface State {
   selectVersion: (id: string) => void;
   setDraftGraph: (g: WfGraph) => void;
   saveDraft: () => Promise<void>;
-  validate: () => Promise<any>;
-  publish: () => Promise<any>;
+  validate: () => Promise<WorkflowInvokeResult | null>;
+  publish: () => Promise<WorkflowInvokeResult | null>;
   archive: (versionId: string) => Promise<void>;
   rollback: (definitionId: string, targetVersionId: string) => Promise<void>;
   createDraftFromVersion: (versionId: string) => Promise<string | null>;
@@ -52,13 +69,13 @@ interface State {
   startMigration: (definitionId: string, from: string, to: string, strategy?: string) => Promise<string | null>;
 }
 
-async function invoke(action: string, body: any) {
+async function invoke(action: string, body: Record<string, unknown>): Promise<WorkflowInvokeResult> {
   const { data, error } = await supabase.functions.invoke("workflow-publish", {
     body: { action, ...body },
   });
   if (error) throw error;
   if (data?.error) throw new Error(data.error);
-  return data;
+  return (data ?? {}) as WorkflowInvokeResult;
 }
 
 export const useWorkflowStudio = create<State>((set, get) => ({
@@ -76,13 +93,13 @@ export const useWorkflowStudio = create<State>((set, get) => ({
       supabase.from("connector_schemas").select("*").order("connector", { ascending: true }),
     ]);
     const publishedMap: Record<string, string> = {};
-    (pub.data ?? []).forEach((r: any) => { publishedMap[r.definition_id] = r.version_id; });
+    (pub.data ?? []).forEach((r) => { publishedMap[r.definition_id] = r.version_id; });
     set({
-      definitions: (defs.data ?? []) as any,
-      versions: (vers.data ?? []) as any,
+      definitions: (defs.data ?? []) as WfDefinition[],
+      versions: (vers.data ?? []) as WfVersion[],
       publishedMap,
-      migrations: migs.data ?? [],
-      schemas: (sch.data ?? []) as any,
+      migrations: (migs.data ?? []) as WfMigration[],
+      schemas: (sch.data ?? []) as ConnectorSchema[],
       loading: false,
     });
     const st = get();

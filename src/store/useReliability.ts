@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import type { Json } from "@/integrations/supabase/types";
+
+type GraphNode = Record<string, Json | undefined>;
+type GraphEdge = Record<string, Json | undefined>;
 
 type Run = {
   id: string;
@@ -40,8 +44,8 @@ type Version = {
   id: string;
   definition_id: string;
   version: number;
-  graph: any;
-  validation: any;
+  graph: { nodes?: GraphNode[]; edges?: GraphEdge[] } | null;
+  validation: Json;
   state: string;
 };
 
@@ -67,7 +71,7 @@ type Anomaly = {
   metric_value: number | null;
   baseline_value: number | null;
   explanation: string;
-  evidence: any;
+  evidence: Json;
 };
 
 type Breaker = {
@@ -127,9 +131,9 @@ export const useReliability = create<ReliabilityState>((set, get) => ({
       supabase.from("workflow_rollbacks").select("id,run_id,started_at").gte("started_at", since).limit(500),
     ]);
 
-    const runs = (runsR.data ?? []) as any[];
+    const runs = (runsR.data ?? []) as Run[];
     const runIds = runs.map((r) => r.id);
-    let steps: any[] = [];
+    const steps: Step[] = [];
     if (runIds.length) {
       const chunk = 500;
       for (let i = 0; i < runIds.length; i += chunk) {
@@ -138,7 +142,7 @@ export const useReliability = create<ReliabilityState>((set, get) => ({
           .select("id,run_id,name,connector,state,duration_ms,retry_count,attempt,started_at,error")
           .in("run_id", runIds.slice(i, i + chunk))
           .limit(5000);
-        if (data) steps.push(...data);
+        if (data) steps.push(...(data as Step[]));
       }
     }
 
@@ -512,7 +516,7 @@ export function mapDependencies(
 ): DependencyMap[] {
   return definitions.map((d) => {
     const v = versions.find((v) => v.definition_id === d.id && v.version === d.latest_version);
-    const nodes: any[] = v?.graph?.nodes ?? [];
+    const nodes = v?.graph?.nodes ?? [];
     const connectors = Array.from(new Set(nodes.map((n) => n.connector).filter(Boolean)));
     const secrets = Array.from(new Set(nodes.flatMap((n) => n.secrets ?? []).filter(Boolean))) as string[];
 
@@ -565,8 +569,8 @@ export function reviewReadiness(
   return definitions.map((d) => {
     const v = versions.find((x) => x.definition_id === d.id && x.version === d.latest_version);
     const findings: ReadinessReview["findings"] = [];
-    const nodes: any[] = v?.graph?.nodes ?? [];
-    const edges: any[] = v?.graph?.edges ?? [];
+    const nodes = v?.graph?.nodes ?? [];
+    const edges = v?.graph?.edges ?? [];
 
     // Cycle detection
     const adj = new Map<string, string[]>();

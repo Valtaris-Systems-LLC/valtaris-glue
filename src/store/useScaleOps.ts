@@ -50,11 +50,11 @@ export const useScaleOps = create<State>((set, get) => ({
       supabase.from("load_benchmarks").select("*").order("started_at", { ascending: false }).limit(10),
     ]);
     set({
-      pressure: (p.data ?? []) as any,
-      workers: (w.data ?? []) as any,
-      breakers: (b.data ?? []) as any,
-      spans: (s.data ?? []) as any,
-      benchmarks: (bm.data ?? []) as any,
+      pressure: (p.data ?? []) as PressureRow[],
+      workers: (w.data ?? []) as WorkerSnap[],
+      breakers: (b.data ?? []) as Breaker[],
+      spans: (s.data ?? []) as Span[],
+      benchmarks: (bm.data ?? []) as Benchmark[],
       loading: false,
     });
   },

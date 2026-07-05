@@ -31,13 +31,14 @@ export function UserMenu() {
 
   const email = user.email ?? '';
   const initials = email.slice(0, 2).toUpperCase();
+  const avatarUrl = typeof user.user_metadata?.avatar_url === 'string' ? user.user_metadata.avatar_url : undefined;
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-muted transition-colors">
           <Avatar className="h-7 w-7 border border-border">
-            <AvatarImage src={(user.user_metadata as any)?.avatar_url} alt={email} />
+            <AvatarImage src={avatarUrl} alt={email} />
             <AvatarFallback className="text-[11px] font-medium">{initials}</AvatarFallback>
           </Avatar>
           <span className="hidden md:inline text-sm font-medium text-foreground max-w-[160px] truncate">{email}</span>

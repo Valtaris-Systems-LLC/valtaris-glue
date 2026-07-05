@@ -50,7 +50,7 @@ export function ConnectorTelemetryGrid() {
       </header>
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
         {health.map(h => {
-          const tone =
+          const tone: 'success' | 'warning' | 'info' | 'danger' =
             h.status === 'down' ? 'danger'
             : h.status === 'degraded' ? 'warning'
             : h.status === 'retrying' ? 'info'
@@ -64,7 +64,7 @@ export function ConnectorTelemetryGrid() {
                 </div>
                 <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">{h.status}</span>
               </div>
-              <Sparkline data={h.latencySeries} tone={tone as any} height={28} />
+              <Sparkline data={h.latencySeries} tone={tone} height={28} />
               <div className="grid grid-cols-3 gap-2 text-[10px] font-mono tabular-nums">
                 <div>
                   <p className="text-muted-foreground/70 uppercase tracking-wider text-[9px]">p50</p>

@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useApiStore } from '@/store/useApiStore';
+import { useApiStore, type WorkflowStep } from '@/store/useApiStore';
 import { supabase } from '@/integrations/supabase/client';
+import type { Json } from '@/integrations/supabase/types';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from '@/hooks/use-toast';
@@ -9,7 +10,7 @@ import { Sparkles, Loader2, ArrowRight, CheckCircle, Save, RotateCcw } from 'luc
 import { PageHeader } from '@/components/ui/page-header';
 import { StatusBadge } from '@/components/ui/status-badge';
 
-interface GeneratedStep { service: string; action: string; data: Record<string, any>; }
+type GeneratedStep = Pick<WorkflowStep, 'service' | 'action'> & { data: Record<string, Json | undefined> };
 interface GeneratedWorkflow { name: string; steps: GeneratedStep[]; }
 
 const EXAMPLE_PROMPTS = [
@@ -40,9 +41,10 @@ export default function AIBuilder() {
       if (data?.error) throw new Error(data.error);
       if (!data?.workflow) throw new Error('No workflow returned');
       setResult(data.workflow);
-    } catch (err: any) {
-      setError(err.message || 'Failed to generate workflow');
-      toast({ title: 'Generation failed', description: err.message, variant: 'destructive' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to generate workflow';
+      setError(message);
+      toast({ title: 'Generation failed', description: message, variant: 'destructive' });
     } finally { setLoading(false); }
   };
 

@@ -2,6 +2,7 @@
 // Reads tenant-scoped platform tables and exposes operator actions via platform-control.
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import type { Json } from "@/integrations/supabase/types";
 
 export interface TemplateCategory { key: string; name: string; description: string | null; sort_order: number }
 export interface WorkflowTemplate {
@@ -22,7 +23,7 @@ export interface OnboardingProgressRow {
 }
 export interface DeploymentValidation {
   id: string; state: string; passed: number; failed: number; warnings: number;
-  ran_at: string; checks: unknown[];
+  ran_at: string; checks: Json[];
 }
 
 interface PlatformState {
@@ -65,13 +66,13 @@ export const usePlatform = create<PlatformState>((set, get) => ({
       supabase.from("template_installs").select("template_id,installed_at"),
     ]);
     set({
-      categories: (cats.data ?? []) as any,
-      templates: (tmpls.data ?? []) as any,
-      connectors: (conns.data ?? []) as any,
-      onboardingSteps: (steps.data ?? []) as any,
-      progress: (progress.data ?? []) as any,
-      validations: (validations.data ?? []) as any,
-      installs: (installs.data ?? []) as any,
+      categories: (cats.data ?? []) as TemplateCategory[],
+      templates: (tmpls.data ?? []) as WorkflowTemplate[],
+      connectors: (conns.data ?? []) as ConnectorCatalogEntry[],
+      onboardingSteps: (steps.data ?? []) as OnboardingStep[],
+      progress: (progress.data ?? []) as OnboardingProgressRow[],
+      validations: (validations.data ?? []) as DeploymentValidation[],
+      installs: (installs.data ?? []) as { template_id: string; installed_at: string }[],
       loading: false,
     });
   },
