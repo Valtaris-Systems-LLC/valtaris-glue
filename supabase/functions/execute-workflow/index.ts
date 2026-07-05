@@ -6,6 +6,7 @@
 // run-worker through typed connector adapters.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { buildRootWorkflowJobs, normalizeExecuteWorkflowRequest } from "./logic.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -23,10 +24,10 @@ Deno.serve(async (req) => {
 
   try {
     const body = await req.json().catch(() => ({}));
-    const dag_id = body.dag_id ?? "demo.live";
-    const workflow_name = body.workflow_name ?? "Live demo workflow";
-    const correlation_id = body.correlation_id ?? crypto.randomUUID();
-    const payload = body.payload ?? {};
+    const { dag_id, workflow_name, correlation_id, payload } = normalizeExecuteWorkflowRequest(
+      body,
+      () => crypto.randomUUID(),
+    );
 
     const { data: dagRow, error: dagErr } = await sb.from("workflow_dags").select("*").eq("id", dag_id).single();
     if (dagErr || !dagRow) {
@@ -54,15 +55,7 @@ Deno.serve(async (req) => {
     });
 
     // Enqueue root nodes (no dependencies)
-    const roots = graph.nodes.filter((n) => !n.dependsOn || n.dependsOn.length === 0);
-    const rows = roots.map((n) => ({
-      run_id,
-      dag_node_id: n.id,
-      state: "queued" as const,
-      max_retries: n.maxRetries ?? 3,
-      idempotency_key: `${run_id}:${n.id}`,
-      payload: { correlation_id, ...payload },
-    }));
+    const rows = buildRootWorkflowJobs(graph, run_id, correlation_id, payload);
     if (rows.length > 0) {
       const { error: jobsErr } = await sb.from("workflow_jobs").insert(rows);
       if (jobsErr) throw jobsErr;

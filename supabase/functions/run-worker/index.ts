@@ -17,8 +17,14 @@
 
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { getConnector } from "../_shared/connectors.ts";
-import { DEFAULT_POLICY, nextBackoffMs, shouldRetry } from "../_shared/retry.ts";
-import { type DagGraph, isTerminal, nodeById, type NodeState, readyNodes } from "../_shared/dag.ts";
+import { type DagGraph, nodeById } from "../_shared/dag.ts";
+import {
+  buildDownstreamJobInserts,
+  createApprovalPausePlan,
+  createDeadLetterPlan,
+  createRetryPlan,
+  deriveRunFinalization,
+} from "./logic.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -175,35 +181,26 @@ async function processJob(sb: SupabaseClient, job: Job) {
       .maybeSingle();
 
     if (!existingApproval) {
-      const expires = new Date(Date.now() + 30 * 60_000).toISOString();
-      const { data: appr } = await sb.from("workflow_approvals").insert({
-        run_id: job.run_id,
-        job_id: job.id,
-        dag_node_id: node.id,
-        state: "pending",
-        expires_at: expires,
-        requested_at: new Date().toISOString(),
-      }).select().single();
+      const approvalPlan = createApprovalPausePlan({
+        runId: job.run_id,
+        jobId: job.id,
+        nodeId: node.id,
+        nodeName: node.name,
+      });
+      const { data: appr } = await sb.from("workflow_approvals").insert(approvalPlan.approvalInsert).select().single();
 
-      await sb.from("workflow_jobs").update({
-        state: "delayed",
-        backoff_until: expires,
-        scheduled_at: expires,
-        worker_id: null,
-        started_at: null,
-        updated_at: new Date().toISOString(),
-      }).eq("id", job.id);
+      await sb.from("workflow_jobs").update(approvalPlan.jobUpdate).eq("id", job.id);
 
-      await sb.from("workflow_runs").update({ state: "waiting_for_approval" }).eq("id", job.run_id);
+      await sb.from("workflow_runs").update(approvalPlan.runUpdate).eq("id", job.run_id);
 
       await emit(sb, job.run_id, null, "approval.requested", "warn",
         `⏸ Awaiting approval: ${node.name}`,
-        { approval_id: appr?.id, node_id: node.id, expires_at: expires });
+        { approval_id: appr?.id, ...approvalPlan.event.data });
 
       await sb.from("runtime_audit_log").insert({
-        actor: "worker", action: "approval.request",
+        actor: approvalPlan.auditLog.actor, action: approvalPlan.auditLog.action,
         subject_type: "approval", subject_id: appr?.id ?? null,
-        details: { run_id: job.run_id, job_id: job.id, node_id: node.id },
+        details: approvalPlan.auditLog.details,
       });
       return;
     } else if (existingApproval.state === "rejected" || existingApproval.state === "expired") {
@@ -345,72 +342,49 @@ async function processJob(sb: SupabaseClient, job: Job) {
   }
 
   // ── Failure path ─────────────────────────────────────────
-  const policy = { ...DEFAULT_POLICY, maxRetries: job.max_retries };
   const nextAttempt = job.retry_attempt + 1;
-  const canRetry = shouldRetry(result.error, nextAttempt, policy);
+  const retryPlan = result.error ? createRetryPlan({
+    jobId: job.id,
+    nodeName: node.name,
+    retryAttempt: job.retry_attempt,
+    maxRetries: job.max_retries,
+    error: result.error,
+  }) : null;
 
-  if (canRetry) {
-    const backoff = nextBackoffMs(nextAttempt, policy);
-    const until = new Date(Date.now() + backoff).toISOString();
+  if (retryPlan) {
+    await sb.from("workflow_step_runs").update(retryPlan.stepUpdate).eq("id", step_id!);
 
-    await sb.from("workflow_step_runs").update({
-      state: "retrying",
-      retry_count: nextAttempt,
-      error: result.error?.message ?? "unknown",
-    }).eq("id", step_id!);
+    await sb.from("workflow_jobs").update(retryPlan.jobUpdate).eq("id", job.id);
 
-    await sb.from("workflow_jobs").update({
-      state: "retrying",
-      retry_attempt: nextAttempt,
-      backoff_until: until,
-      scheduled_at: until,
-      worker_id: null,
-      started_at: null,
-      error: result.error?.message ?? "unknown",
-      updated_at: new Date().toISOString(),
-    }).eq("id", job.id);
-
-    await emit(sb, job.run_id, step_id, "step.retry", "warn",
-      `↻ ${node.name} retry ${nextAttempt}/${policy.maxRetries} in ${backoff}ms`,
-      { backoff_ms: backoff, kind: result.error?.kind });
+    await emit(sb, job.run_id, step_id, retryPlan.event.type, retryPlan.event.severity,
+      retryPlan.event.message,
+      retryPlan.event.data);
     return;
   }
 
   // Exhausted or non-retryable → dead-letter + incident
-  await sb.from("workflow_step_runs").update({
-    state: "failed",
-    ended_at: new Date().toISOString(),
-    duration_ms: result.latency_ms,
-    error: result.error?.message ?? "failed",
-  }).eq("id", step_id!);
-
-  await sb.from("workflow_jobs").update({
-    state: "dead_letter",
-    completed_at: new Date().toISOString(),
-    error: result.error?.message ?? "failed",
-    updated_at: new Date().toISOString(),
-  }).eq("id", job.id);
-
-  await sb.from("workflow_dead_letter").insert({
-    job_id: job.id,
-    run_id: job.run_id,
-    dag_node_id: node.id,
-    attempts: nextAttempt,
-    last_error: result.error?.message ?? "failed",
-    payload: job.payload,
-  });
-
-  await sb.from("workflow_incidents").insert({
-    run_id: job.run_id,
-    severity: "error",
-    category: "dead_letter",
+  const deadLetterPlan = createDeadLetterPlan({
+    jobId: job.id,
+    runId: job.run_id,
+    nodeId: node.id,
+    nodeName: node.name,
     connector: node.connector,
-    summary: `Step "${node.name}" dead-lettered after ${nextAttempt} attempts: ${result.error?.message ?? "failed"}`,
+    nextAttempt,
+    payload: job.payload,
+    latencyMs: result.latency_ms,
+    error: result.error,
   });
+  await sb.from("workflow_step_runs").update(deadLetterPlan.stepUpdate).eq("id", step_id!);
 
-  await emit(sb, job.run_id, step_id, "step.failed", "error",
-    `✗ ${node.name} dead-lettered (${result.error?.kind ?? "unknown"})`,
-    { kind: result.error?.kind, attempts: nextAttempt });
+  await sb.from("workflow_jobs").update(deadLetterPlan.jobUpdate).eq("id", job.id);
+
+  await sb.from("workflow_dead_letter").insert(deadLetterPlan.deadLetterInsert);
+
+  await sb.from("workflow_incidents").insert(deadLetterPlan.incidentInsert);
+
+  await emit(sb, job.run_id, step_id, deadLetterPlan.event.type, deadLetterPlan.event.severity,
+    deadLetterPlan.event.message,
+    deadLetterPlan.event.data);
 }
 
 async function enqueueDownstream(sb: SupabaseClient, runId: string, completedNodeId: string) {
@@ -419,27 +393,15 @@ async function enqueueDownstream(sb: SupabaseClient, runId: string, completedNod
   const graph = (dagRow?.graph ?? { nodes: [] }) as DagGraph;
 
   const { data: jobs } = await sb.from("workflow_jobs").select("dag_node_id,state").eq("run_id", runId);
-  const states: Record<string, NodeState> = {};
-  for (const n of graph.nodes) states[n.id] = "pending";
-  for (const j of jobs ?? []) {
-    if (j.state === "completed") states[j.dag_node_id] = "completed";
-    else if (j.state === "dead_letter" || j.state === "failed") states[j.dag_node_id] = "failed";
-    else states[j.dag_node_id] = "queued";
-  }
-
-  const ready = readyNodes(graph, states).filter((n) => n.id !== completedNodeId);
-  for (const n of ready) {
-    const idem = `${runId}:${n.id}`;
-    await sb.from("workflow_jobs").insert({
-      run_id: runId,
-      tenant_id: run?.tenant_id,
-      workflow_version_id: run?.workflow_version_id ?? null,
-      dag_node_id: n.id,
-      state: "queued",
-      max_retries: n.maxRetries ?? 3,
-      idempotency_key: idem,
-      payload: { correlation_id: run?.correlation_id },
-    }).then(() => {}, () => {/* unique violation = already enqueued, fine */});
+  const ready = buildDownstreamJobInserts({
+    graph,
+    jobs: jobs ?? [],
+    runId,
+    completedNodeId,
+    runContext: run ?? {},
+  });
+  for (const pendingJob of ready) {
+    await sb.from("workflow_jobs").insert(pendingJob).then(() => {}, () => {/* unique violation = already enqueued, fine */});
   }
 }
 
@@ -451,34 +413,22 @@ async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
   const graph = (dagRow?.graph ?? { nodes: [] }) as DagGraph;
 
   const { data: jobs } = await sb.from("workflow_jobs").select("dag_node_id,state").eq("run_id", runId);
-  const states: Record<string, NodeState> = {};
-  for (const n of graph.nodes) states[n.id] = "pending";
-  for (const j of jobs ?? []) {
-    if (j.state === "completed") states[j.dag_node_id] = "completed";
-    else if (j.state === "dead_letter" || j.state === "failed") states[j.dag_node_id] = "failed";
-    else states[j.dag_node_id] = j.state === "running" ? "running" : "queued";
-  }
-  const { done, failed } = isTerminal(graph, states);
-  if (!done) return;
+  const finalization = deriveRunFinalization({
+    graph,
+    jobs: jobs ?? [],
+    startedAt: run.started_at,
+  });
+  if (!finalization) return;
 
-  const ended = new Date();
-  const duration = ended.getTime() - new Date(run.started_at).getTime();
-  await sb.from("workflow_runs").update({
-    state: failed ? "failed" : "completed",
-    status: failed ? "failed" : "completed",
-    ended_at: ended.toISOString(),
-    duration_ms: duration,
-    error: failed ? "One or more steps failed" : null,
-    result: failed ? null : { nodes: graph.nodes.length },
-  }).eq("id", runId);
+  await sb.from("workflow_runs").update(finalization.update).eq("id", runId);
 
   await sb.from("workflow_events").insert({
     run_id: runId,
-    type: failed ? "run.failed" : "run.completed",
-    severity: failed ? "error" : "info",
+    type: finalization.event.type,
+    severity: finalization.event.severity,
     source: "run-worker",
-    message: failed ? `Run failed in ${duration}ms` : `Run completed in ${duration}ms`,
-    data: { duration_ms: duration },
+    message: finalization.event.message,
+    data: finalization.event.data,
   });
 }
 

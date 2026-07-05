@@ -38,6 +38,21 @@ alongside the runtime; not aspirational.
 - **Telemetry granularity.** Aggregates roll up at one-minute resolution;
   sub-minute spikes visible only in raw `workflow_events`.
 
+## Runtime credibility sprint — verification status
+
+- **Security audit.** Vite/esbuild audit findings were cleared by upgrading the
+  frontend toolchain to Vite 8 and refreshing the lockfile.
+- **Runtime verification.** Vitest now covers workflow enqueue behavior, worker
+  downstream scheduling and finalization, retry/backoff policy, approval
+  pause/resume control flow, replay checkpoint resume behavior, and runtime
+  validation reporting through local fixtures and Supabase-style stubs.
+- **Local validation.** `npm test`, `npm run test:runtime`, `npm run test:coverage`,
+  and `npm run build` pass locally after the sprint changes.
+- **Remaining lint debt.** Repository-wide lint still fails with 129 errors and
+  14 warnings, concentrated in pre-existing UI/store files and a legacy
+  `tailwind.config.ts` import pattern. This sprint intentionally did not widen
+  scope to clean unrelated lint debt.
+
 ## PLANNED — designed, not yet started
 
 - Replay re-execution mode (currently observational only) with

@@ -3,6 +3,7 @@
 // The acting operator is derived from the JWT, not a body param.
 
 import { requireUser, serviceClient, logSecurity } from "../_shared/auth.ts";
+import { buildApprovalInvocation } from "./logic.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -31,13 +32,9 @@ Deno.serve(async (req) => {
       });
     }
 
-    const rpcName = decision === "approve" ? "resume_after_approval" : "reject_approval";
-    const args: Record<string, unknown> =
-      decision === "approve"
-        ? { _approval_id: approval_id, _operator_uid: operator_uid }
-        : { _approval_id: approval_id, _operator_uid: operator_uid, _reason: reason ?? null };
+    const invocation = buildApprovalInvocation(approval_id, decision, operator_uid, reason);
 
-    const { error } = await sb.rpc(rpcName, args);
+    const { error } = await sb.rpc(invocation.rpcName, invocation.args);
     if (error) {
       await logSecurity({
         actor_user_id: operator_uid,
@@ -53,7 +50,7 @@ Deno.serve(async (req) => {
       });
     }
 
-    if (decision === "approve") {
+    if (invocation.shouldKickWorker) {
       // kick the worker so the released job is drained immediately
       const url = Deno.env.get("SUPABASE_URL")!;
       const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
