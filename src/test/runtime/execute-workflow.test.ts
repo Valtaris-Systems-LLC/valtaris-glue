@@ -16,12 +16,13 @@ describe("execute-workflow logic", () => {
   });
 
   it("enqueues only root DAG nodes for a happy-path workflow", () => {
-    const jobs = buildRootWorkflowJobs(happyPathWorkflow, "run-1", "corr-1", "tenant-a", { tenant: "acme" });
+    const jobs = buildRootWorkflowJobs(happyPathWorkflow, "run-1", "corr-1", "tenant-a", { tenant: "acme" }, "wv-1");
 
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).toMatchObject({
       run_id: "run-1",
       tenant_id: "tenant-a",
+      workflow_version_id: "wv-1",
       dag_node_id: "ingest",
       state: "queued",
       max_retries: 3,

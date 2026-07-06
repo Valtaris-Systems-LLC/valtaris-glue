@@ -43,6 +43,16 @@ phase-relative; see git history for exact timestamps.
 
 ## Phase — Production Runtime Scale
 
+- Runtime entrypoints now resolve immutable `workflow_versions` before
+  enqueueing work and only fall back to legacy `workflow_dags` when no
+  published version exists.
+- `execute-workflow`, trigger ingress, `run-worker`, rollback execution, and
+  replay metadata now preserve pinned `workflow_version_id` across runtime
+  lifecycle records.
+- Added runtime coverage for published-version pinning after studio edits,
+  rollback version selection, replay version preservation, and legacy DAG
+  compatibility.
+
 - Worker lifecycle: `renew_job_lease`, `worker_shutdown`, `worker-health` probe.
 - Scaling signals: `scaling_metrics`, `queue_pressure_signals`,
   `worker_capacity_snapshots`, `capture_queue_pressure` RPC.

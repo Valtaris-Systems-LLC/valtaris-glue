@@ -3,6 +3,7 @@
 // Centralizing this guarantees identical lineage, telemetry, and replay semantics.
 
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { resolveExecutionSource } from "./runtime-versioning.ts";
 
 export interface EnqueueArgs {
   tenant_id: string;
@@ -25,8 +26,6 @@ export interface EnqueueResult {
   error?: string;
   suppressed_reason?: string;
 }
-
-interface DagNode { id: string; dependsOn?: string[]; maxRetries?: number }
 
 const MAX_DEPTH = 5;
 
@@ -64,11 +63,15 @@ export async function enqueueFromTrigger(sb: SupabaseClient, a: EnqueueArgs): Pr
     return { ok: false, suppressed_reason: "max_depth_exceeded" };
   }
 
-  const { data: dag } = await sb.from("workflow_dags").select("id, name").eq("id", a.dag_id).maybeSingle();
-  if (!dag) return { ok: false, error: `dag ${a.dag_id} not found` };
+  const resolved = await resolveExecutionSource(sb, {
+    tenantId: a.tenant_id,
+    dagId: a.dag_id,
+    workflowVersionId: a.workflow_version_id,
+    workflowName: a.workflow_name,
+  });
 
   const correlation_id = a.correlation_id ?? crypto.randomUUID();
-  const workflow_name = a.workflow_name ?? dag.name ?? a.dag_id;
+  const workflow_name = resolved.workflowName;
 
   const { data: runRow, error: runErr } = await sb.from("workflow_runs").insert({
     workflow_name,
@@ -77,7 +80,7 @@ export async function enqueueFromTrigger(sb: SupabaseClient, a: EnqueueArgs): Pr
     state: "queued",
     status: "queued",
     correlation_id,
-    workflow_version_id: a.workflow_version_id ?? null,
+    workflow_version_id: resolved.workflowVersionId,
     payload: { ...(a.payload ?? {}), _trigger: { kind: a.trigger_kind, source: a.source_label, depth } },
     started_at: new Date().toISOString(),
   }).select("id").single();
@@ -85,9 +88,7 @@ export async function enqueueFromTrigger(sb: SupabaseClient, a: EnqueueArgs): Pr
   const run_id = runRow.id as string;
 
   // DAG roots → jobs
-  const { data: dagFull } = await sb.from("workflow_dags").select("graph").eq("id", a.dag_id).single();
-  const graph = (dagFull?.graph ?? { nodes: [] }) as { nodes: DagNode[] };
-  const roots = graph.nodes.filter((n) => !n.dependsOn || n.dependsOn.length === 0);
+  const roots = resolved.graph.nodes.filter((n) => !n.dependsOn || n.dependsOn.length === 0);
   if (roots.length > 0) {
     await sb.from("workflow_jobs").insert(roots.map((n) => ({
       run_id,
@@ -96,7 +97,7 @@ export async function enqueueFromTrigger(sb: SupabaseClient, a: EnqueueArgs): Pr
       state: "queued",
       max_retries: n.maxRetries ?? 3,
       idempotency_key: `${run_id}:${n.id}`,
-      workflow_version_id: a.workflow_version_id ?? null,
+      workflow_version_id: resolved.workflowVersionId,
       payload: { correlation_id, ...(a.payload ?? {}) },
     })));
   }
@@ -112,7 +113,13 @@ export async function enqueueFromTrigger(sb: SupabaseClient, a: EnqueueArgs): Pr
     severity: "info",
     source: "trigger-ingress",
     message: `Run enqueued via ${a.trigger_kind} (${a.source_label ?? "unknown"})`,
-    data: { correlation_id, depth, trigger_id: a.trigger_id ?? null },
+    data: {
+      correlation_id,
+      depth,
+      trigger_id: a.trigger_id ?? null,
+      workflow_version_id: resolved.workflowVersionId,
+      resolution_source: resolved.resolutionSource,
+    },
   });
 
   // Activation record

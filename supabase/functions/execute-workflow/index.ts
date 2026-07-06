@@ -7,14 +7,13 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { requireTenantBinding } from "../_shared/auth.ts";
+import { resolveExecutionSource } from "../_shared/runtime-versioning.ts";
 import { buildRootWorkflowJobs, normalizeExecuteWorkflowRequest } from "./logic.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
-
-interface DagNode { id: string; dependsOn?: string[]; maxRetries?: number; }
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -39,27 +38,21 @@ Deno.serve(async (req) => {
     );
     const tenant_id = binding.ctx.tenantId;
 
-    const { data: dagRow, error: dagErr } = await sb
-      .from("workflow_dags")
-      .select("*")
-      .eq("id", dag_id)
-      .eq("tenant_id", tenant_id)
-      .single();
-    if (dagErr || !dagRow) {
-      return new Response(JSON.stringify({ error: `dag ${dag_id} not found` }), {
-        status: 404, headers: { ...cors, "Content-Type": "application/json" },
-      });
-    }
-    const graph = dagRow.graph as { nodes: DagNode[] };
+    const resolved = await resolveExecutionSource(sb, {
+      tenantId: tenant_id,
+      dagId: dag_id,
+      workflowName: workflow_name,
+    });
 
     const { data: runRow, error: runErr } = await sb.from("workflow_runs").insert({
-      workflow_name,
+      workflow_name: resolved.workflowName,
       dag_id,
       tenant_id,
       user_id: binding.ctx.userId,
       state: "queued",
       status: "queued",
       correlation_id,
+      workflow_version_id: resolved.workflowVersionId,
       payload,
       started_at: new Date().toISOString(),
     }).select().single();
@@ -72,12 +65,25 @@ Deno.serve(async (req) => {
       type: "run.enqueued",
       severity: "info",
       source: "execute-workflow",
-      message: `Run enqueued: ${workflow_name}`,
-      data: { correlation_id, dag_id, actor_user_id: binding.ctx.userId },
+      message: `Run enqueued: ${resolved.workflowName}`,
+      data: {
+        correlation_id,
+        dag_id,
+        actor_user_id: binding.ctx.userId,
+        workflow_version_id: resolved.workflowVersionId,
+        resolution_source: resolved.resolutionSource,
+      },
     });
 
     // Enqueue root nodes (no dependencies)
-    const rows = buildRootWorkflowJobs(graph, run_id, correlation_id, tenant_id, payload);
+    const rows = buildRootWorkflowJobs(
+      resolved.graph,
+      run_id,
+      correlation_id,
+      tenant_id,
+      payload,
+      resolved.workflowVersionId,
+    );
     if (rows.length > 0) {
       const { error: jobsErr } = await sb.from("workflow_jobs").insert(rows);
       if (jobsErr) throw jobsErr;

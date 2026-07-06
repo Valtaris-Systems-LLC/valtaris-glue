@@ -11,7 +11,14 @@ describe("replay and checkpoint logic", () => {
 
   it("builds a replay run payload that tracks the source run and resume point", () => {
     const replayRun = buildReplayRunInsert({
-      source: { workflow_name: "Order workflow", workflow_id: "wf-1", payload: { order_id: "ord-1" } },
+      source: {
+        workflow_name: "Order workflow",
+        workflow_id: "wf-1",
+        dag_id: "orders",
+        tenant_id: "tenant-1",
+        workflow_version_id: "wv-7",
+        payload: { order_id: "ord-1" },
+      },
       sourceRunId: "run-source",
       correlationId: "corr-replay",
       resumeIndex: 2,
@@ -22,6 +29,11 @@ describe("replay and checkpoint logic", () => {
       order_id: "ord-1",
       replay_of: "run-source",
       resume_from: 2,
+    });
+    expect(replayRun).toMatchObject({
+      dag_id: "orders",
+      tenant_id: "tenant-1",
+      workflow_version_id: "wv-7",
     });
     expect(replayRun.state).toBe("replaying");
   });

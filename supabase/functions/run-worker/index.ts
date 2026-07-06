@@ -18,6 +18,7 @@
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { getConnector } from "../_shared/connectors.ts";
 import { type DagGraph, nodeById } from "../_shared/dag.ts";
+import { resolveExecutionSource } from "../_shared/runtime-versioning.ts";
 import {
   buildDownstreamJobInserts,
   createApprovalPausePlan,
@@ -162,8 +163,13 @@ async function processJob(sb: SupabaseClient, job: Job) {
   // Load DAG + run
   const { data: run } = await sb.from("workflow_runs").select("*").eq("id", job.run_id).single();
   if (!run) throw new Error(`run ${job.run_id} missing`);
-  const { data: dagRow } = await sb.from("workflow_dags").select("*").eq("id", run.dag_id ?? "demo.live").single();
-  const graph = (dagRow?.graph ?? { nodes: [] }) as DagGraph;
+  const resolved = await resolveExecutionSource(sb, {
+    tenantId: run.tenant_id ?? null,
+    dagId: run.dag_id ?? "demo.live",
+    workflowVersionId: run.workflow_version_id ?? null,
+    workflowName: run.workflow_name ?? null,
+  });
+  const graph = resolved.graph as DagGraph;
   const node = nodeById(graph, job.dag_node_id);
   if (!node) throw new Error(`dag node ${job.dag_node_id} missing`);
 
@@ -394,9 +400,14 @@ async function processJob(sb: SupabaseClient, job: Job) {
 }
 
 async function enqueueDownstream(sb: SupabaseClient, runId: string, completedNodeId: string) {
-  const { data: run } = await sb.from("workflow_runs").select("dag_id,correlation_id,workflow_version_id,tenant_id").eq("id", runId).single();
-  const { data: dagRow } = await sb.from("workflow_dags").select("graph").eq("id", run?.dag_id ?? "demo.live").single();
-  const graph = (dagRow?.graph ?? { nodes: [] }) as DagGraph;
+  const { data: run } = await sb.from("workflow_runs").select("dag_id,correlation_id,workflow_version_id,tenant_id,workflow_name").eq("id", runId).single();
+  const resolved = await resolveExecutionSource(sb, {
+    tenantId: run?.tenant_id ?? null,
+    dagId: run?.dag_id ?? "demo.live",
+    workflowVersionId: run?.workflow_version_id ?? null,
+    workflowName: run?.workflow_name ?? null,
+  });
+  const graph = resolved.graph as DagGraph;
 
   const { data: jobs } = await sb.from("workflow_jobs").select("dag_node_id,state").eq("run_id", runId);
   const ready = buildDownstreamJobInserts({
@@ -415,8 +426,13 @@ async function enqueueDownstream(sb: SupabaseClient, runId: string, completedNod
 async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
   const { data: run } = await sb.from("workflow_runs").select("*").eq("id", runId).single();
   if (!run || run.state === "completed" || run.state === "failed") return;
-  const { data: dagRow } = await sb.from("workflow_dags").select("graph").eq("id", run.dag_id ?? "demo.live").single();
-  const graph = (dagRow?.graph ?? { nodes: [] }) as DagGraph;
+  const resolved = await resolveExecutionSource(sb, {
+    tenantId: run.tenant_id ?? null,
+    dagId: run.dag_id ?? "demo.live",
+    workflowVersionId: run.workflow_version_id ?? null,
+    workflowName: run.workflow_name ?? null,
+  });
+  const graph = resolved.graph as DagGraph;
 
   const { data: jobs } = await sb.from("workflow_jobs").select("dag_node_id,state").eq("run_id", runId);
   const finalization = deriveRunFinalization({

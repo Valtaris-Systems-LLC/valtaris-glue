@@ -19,6 +19,7 @@ export interface NormalizedExecuteWorkflowRequest {
 export interface EnqueuedWorkflowJob {
   run_id: string;
   tenant_id: string;
+  workflow_version_id: string | null;
   dag_node_id: string;
   state: "queued";
   max_retries: number;
@@ -45,12 +46,14 @@ export function buildRootWorkflowJobs(
   correlationId: string,
   tenantId: string,
   payload: Record<string, unknown>,
+  workflowVersionId: string | null = null,
 ): EnqueuedWorkflowJob[] {
   return graph.nodes
     .filter((node) => !node.dependsOn || node.dependsOn.length === 0)
     .map((node) => ({
       run_id: runId,
       tenant_id: tenantId,
+      workflow_version_id: workflowVersionId,
       dag_node_id: node.id,
       state: "queued" as const,
       max_retries: node.maxRetries ?? 3,

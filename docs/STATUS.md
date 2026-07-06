@@ -44,13 +44,18 @@ alongside the runtime; not aspirational.
   frontend toolchain to Vite 8 and refreshing the lockfile.
 - **Runtime verification.** Vitest now covers workflow enqueue behavior, worker
   downstream scheduling and finalization, retry/backoff policy, approval
-  pause/resume control flow, replay checkpoint resume behavior, and runtime
-  validation reporting through local fixtures and Supabase-style stubs.
+  pause/resume control flow, replay checkpoint resume behavior, pinned-version
+  resolution across runtime entrypoints, and runtime validation reporting
+  through local fixtures and Supabase-style stubs.
 - **Local validation.** `npm run lint`, `npm test`, `npm run test:runtime`, and
   `npm run build` pass locally after the tenant isolation hardening updates.
 - **Tenant isolation hardening.** Workflow execution now requires an authenticated
   tenant binding, runtime writes propagate `tenant_id`, worker inventory is
   admin-only, and operator-facing realtime feeds subscribe with tenant filters.
+- **Pinned runtime execution.** Execute, trigger, worker, rollback, and replay
+  paths now carry `workflow_version_id` when a published version exists and
+  only fall back to legacy `workflow_dags` for compatibility when no versioned
+  source is available.
 
 ## PLANNED — designed, not yet started
 

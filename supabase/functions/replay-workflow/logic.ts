@@ -11,12 +11,18 @@ export interface ReplayStep {
 export interface ReplaySourceRun {
   workflow_name: string;
   workflow_id?: string | null;
+  dag_id?: string | null;
+  tenant_id?: string | null;
+  workflow_version_id?: string | null;
   payload?: Record<string, unknown> | null;
 }
 
 export interface ReplayRunInsert {
   workflow_name: string;
   workflow_id?: string | null;
+  dag_id?: string | null;
+  tenant_id?: string | null;
+  workflow_version_id?: string | null;
   state: "replaying";
   status: "replaying";
   correlation_id: string;
@@ -65,6 +71,9 @@ export function buildReplayRunInsert(args: {
   return {
     workflow_name: `${args.source.workflow_name} · replay`,
     workflow_id: args.source.workflow_id,
+    dag_id: args.source.dag_id,
+    tenant_id: args.source.tenant_id,
+    workflow_version_id: args.source.workflow_version_id ?? null,
     state: "replaying",
     status: "replaying",
     correlation_id: args.correlationId,

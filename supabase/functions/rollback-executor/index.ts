@@ -7,6 +7,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { getConnector } from "../_shared/connectors.ts";
+import { resolveExecutionSource } from "../_shared/runtime-versioning.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -30,8 +31,13 @@ Deno.serve(async (req) => {
     if (!run) {
       return new Response(JSON.stringify({ error: "run not found" }), { status: 404, headers: cors });
     }
-    const { data: dagRow } = await sb.from("workflow_dags").select("graph").eq("id", run.dag_id ?? "demo.live").single();
-    const graph = (dagRow?.graph ?? { nodes: [] }) as { nodes: DagNode[] };
+    const resolved = await resolveExecutionSource(sb, {
+      tenantId: run.tenant_id ?? null,
+      dagId: run.dag_id ?? "demo.live",
+      workflowVersionId: run.workflow_version_id ?? null,
+      workflowName: run.workflow_name ?? null,
+    });
+    const graph = resolved.graph as { nodes: DagNode[] };
 
     const { data: rollback } = await sb.from("workflow_rollbacks").insert({
       run_id, triggered_by, reason, state: "running",
