@@ -3,6 +3,7 @@
 // claim_due_schedules() advances next_run_at atomically so concurrent ticks
 // don't double-fire.
 
+import { authorizeEndpointRequest } from "../_shared/auth.ts";
 import { svc, enqueueFromTrigger } from "../_shared/triggers.ts";
 
 const cors = {
@@ -14,6 +15,8 @@ const j = (b: unknown, s = 200) =>
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  const access = await authorizeEndpointRequest(req, "scheduler-tick");
+  if (!access.ok) return j({ error: access.error }, access.status);
   const sb = svc();
 
   const { data: due, error } = await sb.rpc("claim_due_schedules", { _limit: 50 });

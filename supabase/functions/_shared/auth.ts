@@ -4,6 +4,13 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 import { claimTenantIds, hasAnyAdminRole, resolveTenantBinding, type TenantMembership } from "./tenant.ts";
+import {
+  accessLevelFromMemberships,
+  authorizeEndpointAccess,
+  isInternalServiceToken,
+  type AccessLevel,
+  type EdgeFunctionName,
+} from "./endpoint-security.ts";
 
 export interface AuthContext {
   userId: string;
@@ -15,6 +22,19 @@ export interface TenantBindingContext extends AuthContext {
   tenantId: string;
   memberships: TenantMembership[];
   isAdmin: boolean;
+}
+
+export interface RequestAccessContext extends AuthContext {
+  kind: "user" | "internal_service";
+  memberships: TenantMembership[];
+  isAdmin: boolean;
+  isOperator: boolean;
+  accessLevel: Exclude<AccessLevel, "anonymous">;
+}
+
+export function readBearerToken(req: Request): string | null {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  return authHeader.startsWith("Bearer ") ? authHeader.replace("Bearer ", "") : null;
 }
 
 export async function requireUser(req: Request): Promise<
@@ -51,6 +71,60 @@ export async function requireTenantBinding(
   req: Request,
   requestedTenantId?: string | null,
 ): Promise<{ ok: true; ctx: TenantBindingContext } | { ok: false; status: number; error: string }> {
+  const access = await requireRequestAccess(req);
+  if (!access.ok) return access;
+  if (access.ctx.kind === "internal_service") {
+    return { ok: false, status: 403, error: "tenant binding requires user identity" };
+  }
+
+  const tenantId = resolveTenantBinding({
+    memberships: access.ctx.memberships,
+    requestedTenantId,
+    claimTenantIds: claimTenantIds(access.ctx.claims),
+  });
+
+  if (!tenantId) {
+    if (requestedTenantId) {
+      return { ok: false, status: 403, error: "tenant access denied" };
+    }
+    return { ok: false, status: 400, error: "tenant binding required" };
+  }
+
+  return {
+    ok: true,
+    ctx: {
+      ...access.ctx,
+      tenantId,
+      memberships: access.ctx.memberships,
+      isAdmin: access.ctx.isAdmin,
+    },
+  };
+}
+
+export async function requireRequestAccess(
+  req: Request,
+): Promise<{ ok: true; ctx: RequestAccessContext } | { ok: false; status: number; error: string }> {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  const bearerToken = readBearerToken(req);
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+  const internalToken = Deno.env.get("VALTARIS_INTERNAL_TOKEN") ?? "";
+
+  if (isInternalServiceToken({ bearerToken, serviceRoleKey, internalToken })) {
+    return {
+      ok: true,
+      ctx: {
+        kind: "internal_service",
+        accessLevel: "internal_service",
+        userId: "internal-service",
+        authHeader,
+        claims: { role: "service_role" },
+        memberships: [],
+        isAdmin: true,
+        isOperator: true,
+      },
+    };
+  }
+
   const auth = await requireUser(req);
   if (!auth.ok) return auth;
 
@@ -69,29 +143,41 @@ export async function requireTenantBinding(
     return { ok: false, status: 403, error: "tenant membership required" };
   }
 
-  const claimIds = claimTenantIds(auth.ctx.claims);
-  const tenantId = resolveTenantBinding({
-    memberships,
-    requestedTenantId,
-    claimTenantIds: claimIds,
-  });
-
-  if (!tenantId) {
-    if (requestedTenantId) {
-      return { ok: false, status: 403, error: "tenant access denied" };
-    }
-    return { ok: false, status: 400, error: "tenant binding required" };
-  }
-
+  const accessLevel = accessLevelFromMemberships(memberships);
   return {
     ok: true,
     ctx: {
       ...auth.ctx,
-      tenantId,
+      kind: "user",
       memberships,
       isAdmin: hasAnyAdminRole(memberships),
+      isOperator: accessLevel === "operator" || accessLevel === "admin",
+      accessLevel,
     },
   };
+}
+
+export async function authorizeEndpointRequest(
+  req: Request,
+  endpoint: EdgeFunctionName,
+): Promise<{ ok: true; ctx: RequestAccessContext } | { ok: false; status: number; error: string }> {
+  const access = await requireRequestAccess(req);
+  if (!access.ok) return access;
+
+  const decision = authorizeEndpointAccess(endpoint, access.ctx.accessLevel);
+  if (!decision.ok) {
+    return decision;
+  }
+
+  return access;
+}
+
+export function userClient(authHeader: string) {
+  return createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: authHeader } } },
+  );
 }
 
 /** Service-role client used to bypass RLS for runtime-internal writes. */

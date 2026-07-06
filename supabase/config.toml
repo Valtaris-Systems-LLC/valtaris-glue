@@ -1,62 +1,66 @@
 project_id = "cqjdncuaxffowqnujaea"
 
 [functions.run-worker]
-verify_jwt = false
+verify_jwt = true
 
 [functions.execute-workflow]
-verify_jwt = false
+verify_jwt = true
+
+[functions.execute-api]
+verify_jwt = true
+
+[functions.generate-workflow]
+verify_jwt = true
 
 [functions.replay-workflow]
-verify_jwt = false
+verify_jwt = true
 
 [functions.tick-connectors]
-verify_jwt = false
+verify_jwt = true
 
 [functions.sla-sweeper]
-verify_jwt = false
+verify_jwt = true
 
 [functions.approval-decision]
-verify_jwt = false
+verify_jwt = true
 
 [functions.rollback-executor]
-verify_jwt = false
+verify_jwt = true
 
 [functions.control-plane]
-verify_jwt = false
+verify_jwt = true
 
 [functions.runtime-validate]
-verify_jwt = false
+verify_jwt = true
 
 [functions.webhook-ingress]
 verify_jwt = false
 
 [functions.scheduler-tick]
-verify_jwt = false
+verify_jwt = true
 
 [functions.manual-launch]
-verify_jwt = false
+verify_jwt = true
 
 [functions.event-trigger-router]
-verify_jwt = false
+verify_jwt = true
 
 [functions.workflow-publish]
-verify_jwt = false
+verify_jwt = true
 
 [functions.scale-monitor]
-verify_jwt = false
+verify_jwt = true
 
 [functions.load-harness]
-verify_jwt = false
+verify_jwt = true
 
 [functions.worker-health]
-verify_jwt = false
+verify_jwt = true
 
 [functions.otel-export]
-verify_jwt = false
+verify_jwt = true
 
 [functions.platform-control]
-verify_jwt = false
-
-
+verify_jwt = true
 
 

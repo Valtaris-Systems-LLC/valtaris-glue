@@ -6,6 +6,7 @@
 // is recorded in workflow_rollbacks.compensations for audit + replay.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { authorizeEndpointRequest } from "../_shared/auth.ts";
 import { getConnector } from "../_shared/connectors.ts";
 import { resolveExecutionSource } from "../_shared/runtime-versioning.ts";
 
@@ -18,6 +19,13 @@ interface DagNode { id: string; name: string; connector: string; compensation?: 
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  const access = await authorizeEndpointRequest(req, "rollback-executor");
+  if (!access.ok) {
+    return new Response(JSON.stringify({ error: access.error }), {
+      status: access.status,
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
   const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   try {

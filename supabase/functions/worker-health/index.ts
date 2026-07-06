@@ -2,6 +2,7 @@
 // GET  -> liveness + recent worker stats
 // POST -> graceful shutdown via worker_shutdown RPC
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { authorizeEndpointRequest } from "../_shared/auth.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -10,6 +11,13 @@ const cors = {
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  const access = await authorizeEndpointRequest(req, "worker-health");
+  if (!access.ok) {
+    return new Response(JSON.stringify({ error: access.error }), {
+      status: access.status,
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
   const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   if (req.method === "POST") {

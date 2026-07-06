@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+import { authorizeEndpointRequest } from "../_shared/auth.ts";
 import { buildRuntimeValidationReport } from "./logic.ts";
 
 const cors = {
@@ -141,6 +142,13 @@ async function run() {
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: cors });
   try {
+    const access = await authorizeEndpointRequest(req, "runtime-validate");
+    if (!access.ok) {
+      return new Response(JSON.stringify({ error: access.error }), {
+        status: access.status,
+        headers: { ...cors, "content-type": "application/json" },
+      });
+    }
     const report = await run();
     return new Response(JSON.stringify(report), {
       headers: { ...cors, "content-type": "application/json" },

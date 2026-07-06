@@ -2,6 +2,7 @@
 // Returns recent trace_spans + telemetry_aggregates in OTLP-ish JSON shape
 // so external collectors (Datadog/Grafana/Honeycomb/New Relic) can scrape.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { authorizeEndpointRequest } from "../_shared/auth.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -10,6 +11,13 @@ const cors = {
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  const access = await authorizeEndpointRequest(req, "otel-export");
+  if (!access.ok) {
+    return new Response(JSON.stringify({ error: access.error }), {
+      status: access.status,
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
   const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
   const url = new URL(req.url);
   const sinceMin = Number(url.searchParams.get("since_minutes") ?? "5");
