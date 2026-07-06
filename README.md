@@ -184,10 +184,24 @@ trigger mock-mode adapter responses so the runtime stays exercisable.
 ## Validation / Testing
 
 ```bash
-bun run lint        # eslint
-bun run test        # vitest
-bun run build       # vite production build
+npm run lint          # eslint
+npm test              # vitest suite
+npm run test:runtime  # runtime-focused vitest suite
+npm run build         # vite production build
 ```
+
+Automated release gating runs the same validation on every `pull_request` and
+every push to `main`, then adds:
+
+- `npm audit --audit-level=high`
+- repository secret scanning
+- CodeQL analysis for JavaScript/TypeScript
+
+The validation workflow retains test-result artifacts, coverage output, and
+build logs for failure triage. See
+`/home/runner/work/valtaris-glue/valtaris-glue/docs/platform/release-validation.md`
+for the required checks, failure-handling flow, and branch-protection
+assumptions.
 
 Runtime validation endpoints:
 

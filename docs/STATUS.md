@@ -47,6 +47,9 @@ alongside the runtime; not aspirational.
   pause/resume control flow, replay checkpoint resume behavior, pinned-version
   resolution across runtime entrypoints, and runtime validation reporting
   through local fixtures and Supabase-style stubs.
+- **CI / release gating.** GitHub Actions now re-run `npm run lint`, `npm test`,
+  `npm run test:runtime`, and `npm run build` on every pull request and push to
+  `main`, alongside `npm audit`, repository secret scanning, and CodeQL.
 - **Local validation.** `npm run lint`, `npm test`, `npm run test:runtime`, and
   `npm run build` pass locally after the tenant isolation hardening updates.
 - **Tenant isolation hardening.** Workflow execution now requires an authenticated
