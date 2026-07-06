@@ -6,6 +6,7 @@
 // run-worker through typed connector adapters.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { requireTenantBinding } from "../_shared/auth.ts";
 import { buildRootWorkflowJobs, normalizeExecuteWorkflowRequest } from "./logic.ts";
 
 const cors = {
@@ -24,12 +25,26 @@ Deno.serve(async (req) => {
 
   try {
     const body = await req.json().catch(() => ({}));
+    const binding = await requireTenantBinding(req, body?.tenant_id ?? null);
+    if (!binding.ok) {
+      return new Response(JSON.stringify({ error: binding.error }), {
+        status: binding.status,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
+
     const { dag_id, workflow_name, correlation_id, payload } = normalizeExecuteWorkflowRequest(
       body,
       () => crypto.randomUUID(),
     );
+    const tenant_id = binding.ctx.tenantId;
 
-    const { data: dagRow, error: dagErr } = await sb.from("workflow_dags").select("*").eq("id", dag_id).single();
+    const { data: dagRow, error: dagErr } = await sb
+      .from("workflow_dags")
+      .select("*")
+      .eq("id", dag_id)
+      .eq("tenant_id", tenant_id)
+      .single();
     if (dagErr || !dagRow) {
       return new Response(JSON.stringify({ error: `dag ${dag_id} not found` }), {
         status: 404, headers: { ...cors, "Content-Type": "application/json" },
@@ -40,6 +55,8 @@ Deno.serve(async (req) => {
     const { data: runRow, error: runErr } = await sb.from("workflow_runs").insert({
       workflow_name,
       dag_id,
+      tenant_id,
+      user_id: binding.ctx.userId,
       state: "queued",
       status: "queued",
       correlation_id,
@@ -50,12 +67,17 @@ Deno.serve(async (req) => {
     const run_id = runRow.id as string;
 
     await sb.from("workflow_events").insert({
-      run_id, type: "run.enqueued", severity: "info", source: "execute-workflow",
-      message: `Run enqueued: ${workflow_name}`, data: { correlation_id, dag_id },
+      run_id,
+      tenant_id,
+      type: "run.enqueued",
+      severity: "info",
+      source: "execute-workflow",
+      message: `Run enqueued: ${workflow_name}`,
+      data: { correlation_id, dag_id, actor_user_id: binding.ctx.userId },
     });
 
     // Enqueue root nodes (no dependencies)
-    const rows = buildRootWorkflowJobs(graph, run_id, correlation_id, payload);
+    const rows = buildRootWorkflowJobs(graph, run_id, correlation_id, tenant_id, payload);
     if (rows.length > 0) {
       const { error: jobsErr } = await sb.from("workflow_jobs").insert(rows);
       if (jobsErr) throw jobsErr;
@@ -68,7 +90,7 @@ Deno.serve(async (req) => {
     const workerUrl = `${url}/functions/v1/run-worker`;
     fetch(workerUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
       body: "{}",
     }).catch((e) => console.error("[execute-workflow] worker kick failed", e));
 

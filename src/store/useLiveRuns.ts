@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import { buildLiveRunsBindings, requireTenantId, resolveTenantScope } from "@/lib/tenantScope";
 import type { WorkflowRun, RunState } from "@/runtime/types";
 
 const MAX = 100;
@@ -25,9 +26,12 @@ export const useLiveRuns = create<LiveRunsState>((set, get) => ({
   connected: false,
 
   hydrate: async () => {
+    const scope = await resolveTenantScope({ dagId: "demo.live" });
+    const tenantId = requireTenantId(scope);
     const { data, error } = await supabase
       .from("workflow_runs")
       .select("*")
+      .eq("tenant_id", tenantId)
       .order("started_at", { ascending: false })
       .limit(MAX);
     if (error) {
@@ -38,22 +42,39 @@ export const useLiveRuns = create<LiveRunsState>((set, get) => ({
   },
 
   subscribe: () => {
-    const channel = supabase
-      .channel("workflow_runs_stream")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "workflow_runs" },
-        (payload) => {
-          const row = payload.new as unknown as WorkflowRun | undefined;
-          if (!row) return;
-          set({ runs: upsert(get().runs, row) });
-        }
-      )
-      .subscribe((status) => set({ connected: status === "SUBSCRIBED" }));
+    let disposed = false;
+    let cleanup = () => {};
+
+    void resolveTenantScope({ dagId: "demo.live" }).then((scope) => {
+      if (disposed) return;
+      const [binding] = buildLiveRunsBindings(scope);
+      if (!binding) {
+        set({ connected: false, runs: [] });
+        return;
+      }
+
+      const channel = supabase
+        .channel(`workflow_runs_stream:${scope.tenantId}`)
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: binding.table, filter: binding.filter },
+          (payload) => {
+            const row = payload.new as unknown as WorkflowRun | undefined;
+            if (!row) return;
+            set({ runs: upsert(get().runs, row) });
+          }
+        )
+        .subscribe((status) => set({ connected: status === "SUBSCRIBED" }));
+
+      cleanup = () => {
+        supabase.removeChannel(channel);
+        set({ connected: false });
+      };
+    });
 
     return () => {
-      supabase.removeChannel(channel);
-      set({ connected: false });
+      disposed = true;
+      cleanup();
     };
   },
 }));

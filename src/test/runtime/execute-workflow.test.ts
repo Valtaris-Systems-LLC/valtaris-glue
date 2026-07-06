@@ -11,15 +11,17 @@ describe("execute-workflow logic", () => {
       workflow_name: "Live demo workflow",
       correlation_id: "corr-123",
       payload: {},
+      tenant_id: undefined,
     });
   });
 
   it("enqueues only root DAG nodes for a happy-path workflow", () => {
-    const jobs = buildRootWorkflowJobs(happyPathWorkflow, "run-1", "corr-1", { tenant: "acme" });
+    const jobs = buildRootWorkflowJobs(happyPathWorkflow, "run-1", "corr-1", "tenant-a", { tenant: "acme" });
 
     expect(jobs).toHaveLength(1);
     expect(jobs[0]).toMatchObject({
       run_id: "run-1",
+      tenant_id: "tenant-a",
       dag_node_id: "ingest",
       state: "queued",
       max_retries: 3,
@@ -29,7 +31,7 @@ describe("execute-workflow logic", () => {
   });
 
   it("supports approval-gated workflows by still queuing the root step", () => {
-    const jobs = buildRootWorkflowJobs(approvalWorkflow, "run-approval", "corr-approval", {});
+    const jobs = buildRootWorkflowJobs(approvalWorkflow, "run-approval", "corr-approval", "tenant-a", {});
 
     expect(jobs.map((job) => job.dag_node_id)).toEqual(["review"]);
   });

@@ -1,5 +1,10 @@
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import {
+  buildControlPlaneBindings,
+  requireTenantId,
+  resolveTenantScope,
+} from "@/lib/tenantScope";
 
 export interface WorkerRow {
   worker_id: string;
@@ -51,10 +56,14 @@ export const useControlPlane = create<State>((set, get) => ({
   health: null,
 
   hydrate: async () => {
+    const scope = await resolveTenantScope();
+    const tenantId = requireTenantId(scope);
     const [w, p, h] = await Promise.all([
-      supabase.from("worker_registry").select("*").order("started_at", { ascending: false }),
-      supabase.from("queue_partitions").select("*").order("partition_key"),
-      supabase.functions.invoke("control-plane", { body: { action: "health" } }),
+      scope.isAdmin
+        ? supabase.from("worker_registry").select("*").order("started_at", { ascending: false })
+        : Promise.resolve({ data: [], error: null }),
+      supabase.from("queue_partitions").select("*").eq("tenant_id", tenantId).order("partition_key"),
+      supabase.functions.invoke("control-plane", { body: { action: "health", tenant_id: tenantId } }),
     ]);
     set({
       workers: (w.data ?? []) as WorkerRow[],
@@ -64,13 +73,32 @@ export const useControlPlane = create<State>((set, get) => ({
   },
 
   subscribe: () => {
-    const ch = supabase
-      .channel("control_plane_stream")
-      .on("postgres_changes", { event: "*", schema: "public", table: "worker_registry" }, () => get().hydrate())
-      .on("postgres_changes", { event: "*", schema: "public", table: "queue_partitions" }, () => get().hydrate())
-      .subscribe();
-    const iv = setInterval(() => get().hydrate(), 10_000);
-    return () => { supabase.removeChannel(ch); clearInterval(iv); };
+    let disposed = false;
+    let cleanup = () => {};
+
+    void resolveTenantScope().then((scope) => {
+      if (disposed) return;
+      const channel = supabase.channel(`control_plane_stream:${scope.tenantId ?? "none"}`);
+      for (const binding of buildControlPlaneBindings(scope)) {
+        channel.on("postgres_changes", {
+          event: "*",
+          schema: "public",
+          table: binding.table,
+          ...(binding.filter ? { filter: binding.filter } : {}),
+        }, () => get().hydrate());
+      }
+      channel.subscribe();
+      const iv = setInterval(() => get().hydrate(), 10_000);
+      cleanup = () => {
+        supabase.removeChannel(channel);
+        clearInterval(iv);
+      };
+    });
+
+    return () => {
+      disposed = true;
+      cleanup();
+    };
   },
 
   drainWorker: async (worker_id) => {

@@ -1,5 +1,10 @@
 import { create } from "zustand";
 import { supabase } from "@/integrations/supabase/client";
+import {
+  buildObservabilityBindings,
+  requireTenantId,
+  resolveTenantScope,
+} from "@/lib/tenantScope";
 
 export interface SlaBreachRow {
   id: string;
@@ -33,10 +38,15 @@ export const useObservability = create<State>((set) => ({
   heartbeats: [],
   queueDepth: 0,
   hydrate: async () => {
+    const scope = await resolveTenantScope();
+    const tenantId = requireTenantId(scope);
     const [b, h, q] = await Promise.all([
-      supabase.from("sla_breaches").select("*").order("detected_at", { ascending: false }).limit(20),
-      supabase.from("worker_heartbeats").select("*").order("last_seen_at", { ascending: false }).limit(10),
+      supabase.from("sla_breaches").select("*").eq("tenant_id", tenantId).order("detected_at", { ascending: false }).limit(20),
+      scope.isAdmin
+        ? supabase.from("worker_heartbeats").select("*").order("last_seen_at", { ascending: false }).limit(10)
+        : Promise.resolve({ data: [], error: null }),
       supabase.from("workflow_jobs").select("id", { count: "exact", head: true })
+        .eq("tenant_id", tenantId)
         .in("state", ["queued", "retrying", "delayed", "claimed", "running"]),
     ]);
     set({
@@ -46,13 +56,32 @@ export const useObservability = create<State>((set) => ({
     });
   },
   subscribe: () => {
-    const ch = supabase
-      .channel("observability_stream")
-      .on("postgres_changes", { event: "*", schema: "public", table: "sla_breaches" }, () => useObservability.getState().hydrate())
-      .on("postgres_changes", { event: "*", schema: "public", table: "worker_heartbeats" }, () => useObservability.getState().hydrate())
-      .on("postgres_changes", { event: "*", schema: "public", table: "workflow_jobs" }, () => useObservability.getState().hydrate())
-      .subscribe();
-    const iv = setInterval(() => useObservability.getState().hydrate(), 15_000);
-    return () => { supabase.removeChannel(ch); clearInterval(iv); };
+    let disposed = false;
+    let cleanup = () => {};
+
+    void resolveTenantScope().then((scope) => {
+      if (disposed) return;
+      const bindings = buildObservabilityBindings(scope);
+      const channel = supabase.channel(`observability_stream:${scope.tenantId ?? "none"}`);
+      for (const binding of bindings) {
+        channel.on("postgres_changes", {
+          event: "*",
+          schema: "public",
+          table: binding.table,
+          ...(binding.filter ? { filter: binding.filter } : {}),
+        }, () => useObservability.getState().hydrate());
+      }
+      channel.subscribe();
+      const iv = setInterval(() => useObservability.getState().hydrate(), 15_000);
+      cleanup = () => {
+        supabase.removeChannel(channel);
+        clearInterval(iv);
+      };
+    });
+
+    return () => {
+      disposed = true;
+      cleanup();
+    };
   },
 }));

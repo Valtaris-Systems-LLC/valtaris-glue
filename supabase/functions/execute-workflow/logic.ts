@@ -5,6 +5,7 @@ export interface ExecuteWorkflowRequestBody {
   workflow_name?: string;
   correlation_id?: string;
   payload?: Record<string, unknown>;
+  tenant_id?: string;
 }
 
 export interface NormalizedExecuteWorkflowRequest {
@@ -12,10 +13,12 @@ export interface NormalizedExecuteWorkflowRequest {
   workflow_name: string;
   correlation_id: string;
   payload: Record<string, unknown>;
+  tenant_id?: string;
 }
 
 export interface EnqueuedWorkflowJob {
   run_id: string;
+  tenant_id: string;
   dag_node_id: string;
   state: "queued";
   max_retries: number;
@@ -32,6 +35,7 @@ export function normalizeExecuteWorkflowRequest(
     workflow_name: body.workflow_name ?? "Live demo workflow",
     correlation_id: body.correlation_id ?? generateId(),
     payload: body.payload ?? {},
+    tenant_id: body.tenant_id,
   };
 }
 
@@ -39,12 +43,14 @@ export function buildRootWorkflowJobs(
   graph: DagGraph,
   runId: string,
   correlationId: string,
+  tenantId: string,
   payload: Record<string, unknown>,
 ): EnqueuedWorkflowJob[] {
   return graph.nodes
     .filter((node) => !node.dependsOn || node.dependsOn.length === 0)
     .map((node) => ({
       run_id: runId,
+      tenant_id: tenantId,
       dag_node_id: node.id,
       state: "queued" as const,
       max_retries: node.maxRetries ?? 3,

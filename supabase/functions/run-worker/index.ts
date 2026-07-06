@@ -186,6 +186,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
         jobId: job.id,
         nodeId: node.id,
         nodeName: node.name,
+        tenantId: run.tenant_id ?? null,
       });
       const { data: appr } = await sb.from("workflow_approvals").insert(approvalPlan.approvalInsert).select().single();
 
@@ -193,11 +194,12 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
       await sb.from("workflow_runs").update(approvalPlan.runUpdate).eq("id", job.run_id);
 
-      await emit(sb, job.run_id, null, "approval.requested", "warn",
+      await emit(sb, job.run_id, null, run.tenant_id ?? null, "approval.requested", "warn",
         `⏸ Awaiting approval: ${node.name}`,
         { approval_id: appr?.id, ...approvalPlan.event.data });
 
       await sb.from("runtime_audit_log").insert({
+        tenant_id: run.tenant_id ?? null,
         actor: approvalPlan.auditLog.actor, action: approvalPlan.auditLog.action,
         subject_type: "approval", subject_id: appr?.id ?? null,
         details: approvalPlan.auditLog.details,
@@ -237,6 +239,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
       .from("workflow_step_runs")
       .insert({
         run_id: job.run_id,
+        tenant_id: run.tenant_id ?? null,
         step_index: stepIndex,
         dag_node_id: node.id,
         name: node.name,
@@ -253,7 +256,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
     step_id = inserted?.id ?? null;
   }
 
-  await emit(sb, job.run_id, step_id, "step.started", "info", `▶ ${node.name}`, {
+  await emit(sb, job.run_id, step_id, run.tenant_id ?? null, "step.started", "info", `▶ ${node.name}`, {
     connector: node.connector, attempt: job.retry_attempt, dag_node_id: node.id,
   });
 
@@ -290,6 +293,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
     await sb.from("workflow_checkpoints").insert({
       run_id: job.run_id,
+      tenant_id: run.tenant_id ?? null,
       workflow_version_id: run.workflow_version_id ?? null,
       step_index: stepIndex,
       snapshot: {
@@ -314,6 +318,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
       const escalated = confidence < 0.7;
       await sb.from("ai_decision_trace").insert({
         run_id: job.run_id,
+        tenant_id: run.tenant_id ?? null,
         model: String(result.data.model ?? "openai/gpt-4o-mini"),
         prompt: String(job.payload.prompt ?? `Workflow ${run.workflow_name}`),
         decision: escalated ? "escalate to human reviewer" : "auto-approve",
@@ -322,12 +327,12 @@ async function processJob(sb: SupabaseClient, job: Job) {
         reasoning: escalated ? "Confidence below 0.70 policy floor." : "Confidence above policy floor.",
         risk: confidence >= 0.85 ? "low" : confidence >= 0.7 ? "medium" : "high",
       });
-      await emit(sb, job.run_id, step_id, "ai.decision", escalated ? "warn" : "info",
+      await emit(sb, job.run_id, step_id, run.tenant_id ?? null, "ai.decision", escalated ? "warn" : "info",
         `AI ${escalated ? "escalated" : "auto-approved"} (${Math.round(confidence * 100)}%)`,
         { confidence, escalated });
     }
 
-    await emit(sb, job.run_id, step_id, "step.completed", "info",
+    await emit(sb, job.run_id, step_id, run.tenant_id ?? null, "step.completed", "info",
       `✓ ${node.name} (${result.latency_ms}ms${result.mock ? " · mock" : ""})`,
       { duration_ms: result.latency_ms, mock: result.mock });
 
@@ -356,7 +361,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
     await sb.from("workflow_jobs").update(retryPlan.jobUpdate).eq("id", job.id);
 
-    await emit(sb, job.run_id, step_id, retryPlan.event.type, retryPlan.event.severity,
+    await emit(sb, job.run_id, step_id, run.tenant_id ?? null, retryPlan.event.type, retryPlan.event.severity,
       retryPlan.event.message,
       retryPlan.event.data);
     return;
@@ -366,6 +371,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
   const deadLetterPlan = createDeadLetterPlan({
     jobId: job.id,
     runId: job.run_id,
+    tenantId: run.tenant_id ?? null,
     nodeId: node.id,
     nodeName: node.name,
     connector: node.connector,
@@ -382,7 +388,7 @@ async function processJob(sb: SupabaseClient, job: Job) {
 
   await sb.from("workflow_incidents").insert(deadLetterPlan.incidentInsert);
 
-  await emit(sb, job.run_id, step_id, deadLetterPlan.event.type, deadLetterPlan.event.severity,
+  await emit(sb, job.run_id, step_id, run.tenant_id ?? null, deadLetterPlan.event.type, deadLetterPlan.event.severity,
     deadLetterPlan.event.message,
     deadLetterPlan.event.data);
 }
@@ -424,6 +430,7 @@ async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
 
   await sb.from("workflow_events").insert({
     run_id: runId,
+    tenant_id: run.tenant_id ?? null,
     type: finalization.event.type,
     severity: finalization.event.severity,
     source: "run-worker",
@@ -433,8 +440,8 @@ async function finalizeRunIfDone(sb: SupabaseClient, runId: string) {
 }
 
 function emit(
-  sb: SupabaseClient, run_id: string, step_id: string | null,
+  sb: SupabaseClient, run_id: string, step_id: string | null, tenant_id: string | null,
   type: string, severity: string, message: string, data: Record<string, unknown> = {},
 ) {
-  return sb.from("workflow_events").insert({ run_id, step_id, type, severity, source: "run-worker", message, data });
+  return sb.from("workflow_events").insert({ run_id, step_id, tenant_id, type, severity, source: "run-worker", message, data });
 }

@@ -59,6 +59,7 @@ describe("run-worker logic", () => {
       nodeName: failingWorkflow.nodes[1].name,
       connector: failingWorkflow.nodes[1].connector,
       nextAttempt: 3,
+      tenantId: "tenant-1",
       payload: { order_id: "ord-1" },
       latencyMs: 180,
       error: { kind: "upstream_5xx", retryable: true, message: "carrier outage" },
@@ -67,6 +68,7 @@ describe("run-worker logic", () => {
 
     expect(plan.jobUpdate.state).toBe("dead_letter");
     expect(plan.deadLetterInsert).toMatchObject({
+      tenant_id: "tenant-1",
       run_id: "run-fail",
       dag_node_id: "ship",
       attempts: 3,

@@ -19,9 +19,10 @@ Provide an append-only event log of every runtime decision, plus rolled-up metri
 | `global` | `queue_depth` | snapshot of `workflow_jobs` in queued/retrying/delayed/claimed/running |
 
 ## Realtime
-Subscriptions use Supabase realtime on `workflow_events`, `workflow_runs`, `worker_registry`, `queue_partitions`. Channels are global today (see Security doc — tenant scoping is roadmap).
+Subscriptions now bind to the authenticated tenant context. `workflow_runs`, `workflow_jobs`, `sla_breaches`, and `queue_partitions` channels use `tenant_id` filters; worker inventory streams remain admin-visible only.
 
 ## Known limitations
 - One-minute granularity for rollups; sub-minute analysis needs raw event scan.
 - No exporter to external observability stack (OTel exporter is on the roadmap).
 - `workflow_events.archived_at` is soft-archive; no cold storage tier yet.
+- Multi-tenant operators must have an auth/org tenant binding before runtime execution or tenant-scoped subscriptions are activated.

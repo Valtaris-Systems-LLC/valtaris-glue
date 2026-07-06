@@ -2,7 +2,7 @@
 // All actions require an authenticated caller; admin-only actions are gated
 // by SQL functions that validate tenant_members.role = 'admin'.
 
-import { requireUser, serviceClient, logSecurity } from "../_shared/auth.ts";
+import { requireTenantBinding, requireUser, serviceClient, logSecurity } from "../_shared/auth.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -80,7 +80,12 @@ Deno.serve(async (req) => {
         return j({ ok: true });
       }
       case "health": {
-        const { data } = await sb.rpc("runtime_health_report");
+        const tenant = await requireTenantBinding(req, body.tenant_id ?? null);
+        if (!tenant.ok) return j({ error: tenant.error }, tenant.status);
+        const { data } = await sb.rpc("runtime_health_report", {
+          _tenant_id: tenant.ctx.tenantId,
+          _include_worker_inventory: tenant.ctx.isAdmin,
+        });
         return j({ ok: true, report: data });
       }
       case "throttle_connector": {

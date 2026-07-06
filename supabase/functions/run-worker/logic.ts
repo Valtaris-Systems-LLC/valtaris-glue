@@ -13,6 +13,7 @@ export interface ApprovalPausePlan {
     run_id: string;
     job_id: string;
     dag_node_id: string;
+    tenant_id: string | null;
     state: "pending";
     expires_at: string;
     requested_at: string;
@@ -99,8 +100,10 @@ export interface DeadLetterPlan {
     attempts: number;
     last_error: string;
     payload: Record<string, unknown>;
+    tenant_id: string | null;
   };
   incidentInsert: {
+    tenant_id: string | null;
     run_id: string;
     severity: "error";
     category: "dead_letter";
@@ -180,6 +183,7 @@ export function createApprovalPausePlan(args: {
   jobId: string;
   nodeId: string;
   nodeName: string;
+  tenantId: string | null;
   now?: Date;
   expiresInMs?: number;
 }): ApprovalPausePlan {
@@ -193,6 +197,7 @@ export function createApprovalPausePlan(args: {
       run_id: args.runId,
       job_id: args.jobId,
       dag_node_id: args.nodeId,
+      tenant_id: args.tenantId,
       state: "pending",
       expires_at: expiresAt,
       requested_at: requestedAt,
@@ -281,6 +286,7 @@ export function createDeadLetterPlan(args: {
   payload: Record<string, unknown>;
   latencyMs: number;
   error?: ConnectorError;
+  tenantId: string | null;
   now?: Date;
 }): DeadLetterPlan {
   const now = (args.now ?? new Date()).toISOString();
@@ -306,8 +312,10 @@ export function createDeadLetterPlan(args: {
       attempts: args.nextAttempt,
       last_error: errorMessage,
       payload: args.payload,
+      tenant_id: args.tenantId,
     },
     incidentInsert: {
+      tenant_id: args.tenantId,
       run_id: args.runId,
       severity: "error",
       category: "dead_letter",

@@ -16,7 +16,7 @@ alongside the runtime; not aspirational.
 - Approvals (tenant-scoped, signed, replay-safe via `decision_id`)
 - Rollback / compensation (reverse-walk over checkpoints)
 - Circuit breakers (per-connector, half-open probing)
-- Tenant isolation (`tenant_id` + RLS + `has_role` on operational paths)
+- Tenant isolation (`tenant_id` propagation + RLS + `has_tenant_access` / `has_operator_role` on execution, control-plane, and realtime paths)
 - Workflow versioning (draft → published → archived, publish-gate validation)
 - External triggering (webhook, scheduler, event-router edge functions)
 - Workflow templates + connector catalog + deployment validation
@@ -46,12 +46,11 @@ alongside the runtime; not aspirational.
   downstream scheduling and finalization, retry/backoff policy, approval
   pause/resume control flow, replay checkpoint resume behavior, and runtime
   validation reporting through local fixtures and Supabase-style stubs.
-- **Local validation.** `npm test`, `npm run test:runtime`, `npm run test:coverage`,
-  and `npm run build` pass locally after the sprint changes.
-- **Remaining lint debt.** Repository-wide lint still fails with 129 errors and
-  14 warnings, concentrated in pre-existing UI/store files and a legacy
-  `tailwind.config.ts` import pattern. This sprint intentionally did not widen
-  scope to clean unrelated lint debt.
+- **Local validation.** `npm run lint`, `npm test`, `npm run test:runtime`, and
+  `npm run build` pass locally after the tenant isolation hardening updates.
+- **Tenant isolation hardening.** Workflow execution now requires an authenticated
+  tenant binding, runtime writes propagate `tenant_id`, worker inventory is
+  admin-only, and operator-facing realtime feeds subscribe with tenant filters.
 
 ## PLANNED — designed, not yet started
 
