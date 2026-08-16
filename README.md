@@ -1,168 +1,284 @@
 # Valtaris Glue
 
-> Enterprise workflow orchestration runtime for governed, replayable, telemetry-native automation across connectors, approvals, and durable background execution.
+> Governed workflow orchestration runtime for durable, replayable, observable automations across connectors, approvals, and operational workflows.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Why This Exists](#why-this-exists)
-- [Core Capabilities](#core-capabilities)
-- [Architecture](#architecture)
-- [Technology Stack](#technology-stack)
-- [Project Structure](#project-structure)
-- [Core Workflows](#core-workflows)
-- [Security](#security)
-- [Database Design](#database-design)
-- [Runtime and API](#runtime-and-api)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Testing and Verification](#testing-and-verification)
-- [Deployment](#deployment)
-- [Performance and Scalability](#performance-and-scalability)
-- [Capability Status](#capability-status)
-- [Known Limitations](#known-limitations)
-- [Roadmap](#roadmap)
-- [Documentation](#documentation)
-- [Screenshots](#screenshots)
-- [Contributing](#contributing)
-- [License](#license)
-- [Author](#author)
+- Overview
+- Why This Exists
+- System Capabilities
+- Key Features
+- Architecture
+- Technology Stack
+- Project Structure
+- Core Workflows
+- Security
+- Database Design
+- API Overview
+- Installation
+- Configuration
+- Testing
+- Deployment
+- Performance
+- Capability Status
+- Roadmap
+- Documentation
+- Screenshots
+- Contributing
+- License
+- Author
+- Acknowledgements
 
 ---
 
 # Overview
 
-Valtaris Glue is a workflow orchestration runtime designed to execute operational automations with durable state, governed execution, approvals, recovery paths, telemetry, and replayability.
+Valtaris Glue is a workflow orchestration platform designed for teams that need to execute operational automations with durable state, governance, auditability, replay, and runtime visibility.
 
-The system combines a React operator console with Supabase/PostgreSQL-backed runtime services, queue-driven workers, workflow versioning, approval gates, connector adapters, rollback mechanisms, and operational telemetry.
+The system combines a React operator console, Supabase-backed runtime services, PostgreSQL persistence, queue-driven workers, approval gates, connector adapters, and telemetry pipelines.
 
-The core design principle is:
+The platform is designed around a simple principle:
 
-> **Workflow execution should be durable, observable, recoverable, and governed rather than dependent on a browser session or a collection of disconnected scripts.**
+**Workflow execution should remain observable, recoverable, and explainable even when individual steps fail or workflows evolve.**
 
-Valtaris Glue is an independent engineering project and research implementation. It is not represented as independently certified, independently audited, or commercially deployed enterprise infrastructure.
+Valtaris Glue is an independent engineering project and research implementation. It is not represented as a commercially deployed enterprise platform, independently certified compliance system, or production-scale service.
 
 ---
 
 # Why This Exists
 
-Modern operations teams frequently automate processes across multiple SaaS platforms, APIs, databases, and internal systems.
+## Business Problem
 
-Without durable orchestration, these workflows can become difficult to:
+Operational teams frequently automate cross-system processes using scripts, manual handoffs, scheduled jobs, and disconnected SaaS integrations.
+
+These approaches can become difficult to:
 
 - observe;
-- retry;
 - recover;
 - audit;
-- replay;
-- version;
 - govern;
-- debug.
+- replay;
+- modify safely;
+- operate across multiple tenants.
 
-A workflow that fails halfway through execution should not require an operator to reconstruct what happened from browser logs, scattered API calls, or transient application state.
+## Technical Challenge
 
-Valtaris Glue explores a different model:
+Reliable orchestration requires more than simply calling APIs.
 
-```text
-Trigger
-   ↓
-Published Workflow Version
-   ↓
-DAG Expansion
-   ↓
-Durable Jobs
-   ↓
-Worker Execution
-   ↓
-Telemetry + Checkpoints
-   ↓
-Dependency Resolution
-   ↓
-Completion / Retry / Approval / Rollback
-```
+A workflow runtime must account for:
 
-The database acts as the durable system of record for workflow execution.
+- durable job persistence;
+- dependency-aware execution;
+- retries;
+- leases;
+- failure recovery;
+- compensation;
+- approvals;
+- tenant boundaries;
+- versioning;
+- telemetry;
+- operator intervention.
+
+A workflow update also needs to avoid unexpectedly changing the behavior of executions that are already in progress.
+
+## Solution
+
+Valtaris Glue addresses these problems through:
+
+- pinned workflow versions;
+- DAG-based execution;
+- durable queue-backed jobs;
+- leased workers;
+- retry and dead-letter handling;
+- approval routing;
+- compensation and rollback;
+- connector adapters;
+- runtime telemetry;
+- replay capabilities;
+- operator-facing controls.
 
 ---
 
-# Core Capabilities
+# System Capabilities
+
+Valtaris Glue currently includes the following system areas:
+
+| Capability | Current Position |
+| --- | --- |
+| Durable workflow execution | Implemented |
+| Queue-backed workers | Implemented |
+| Workflow version pinning | Implemented |
+| DAG execution | Implemented |
+| Parallel workflow branches | Implemented |
+| Approval workflows | Implemented |
+| Retry handling | Implemented |
+| Dead-letter handling | Implemented |
+| Compensation / rollback | Implemented |
+| Runtime telemetry | Implemented |
+| Operator console | Implemented |
+| Workflow replay | Implemented |
+| Connector adapters | Implemented |
+| Scheduled execution | Implemented |
+| Webhook ingress | Implemented |
+| Tenant-aware authorization | Implemented |
+| PostgreSQL RLS | Implemented |
+| AI connector support | Implemented |
+| Formal production-scale benchmarks | Not yet established |
+| Multi-region execution | Roadmap |
+| Long-lived worker hosting | Roadmap |
+| Independent security/compliance certification | Not claimed |
+
+---
+
+# Key Features
 
 ## Durable Workflow Execution
 
-- Queue-backed workflow execution
-- Durable job persistence
-- Worker leasing
-- Retry handling
-- Dead-letter handling
-- Stale-job recovery
-- Checkpoint persistence
-- Background execution independent of browser sessions
+Workflow execution is represented as persisted runtime state rather than depending entirely on an active browser session.
 
-## Workflow Versioning
+Jobs can be:
 
-Published workflows are pinned to a specific version when execution begins.
+- queued;
+- claimed;
+- executed;
+- retried;
+- completed;
+- failed;
+- dead-lettered.
 
-This prevents later workflow edits from unexpectedly changing the behavior of an already-running workflow.
+Workers use leases to reduce the risk of abandoned work remaining indefinitely in an active state.
+
+---
+
+## Pinned Workflow Versions
+
+Published workflows are versioned before execution.
+
+A workflow run references a specific workflow version so that changes to a later published version do not unexpectedly modify the definition being executed by an existing run.
+
+Conceptually:
 
 ```text
-Draft
-  ↓
-Validation
-  ↓
-Published Version
-  ↓
-Execution
-  ↓
-Pinned Runtime
+Workflow
+   │
+   ├── Version 1
+   ├── Version 2
+   └── Version 3
+          │
+          ▼
+     Workflow Run
+          │
+          ▼
+     Pinned Version
 ```
 
-## DAG Orchestration
+This provides a stable execution boundary for individual workflow runs.
 
-Workflows can represent dependency-aware execution across multiple steps.
+---
 
-The runtime supports:
+## DAG-Based Orchestration
 
-- dependent steps;
-- parallel execution;
-- branching;
+Workflows are represented as directed acyclic graphs.
+
+The runtime can evaluate:
+
+- dependencies;
+- parallel branches;
+- downstream unlock conditions;
+- branch outcomes;
 - approval gates;
-- compensation;
-- rollback;
-- retry;
-- failure routing.
+- failure paths;
+- compensation paths.
 
-## Governance
+Example:
 
-Workflow execution can incorporate:
+```text
+             ┌── Step B ──┐
+Step A ──────┤            ├──── Step D
+             └── Step C ──┘
+```
 
-- approval requirements;
-- confidence thresholds;
-- tenant-scoped policies;
-- operator intervention;
-- audit-oriented events;
-- deployment validation.
+Step D does not become eligible until its required dependencies are satisfied.
+
+---
+
+## Approvals and Governance
+
+Certain workflow steps can require human approval before execution continues.
+
+The runtime can route execution into an approval state based on configured workflow conditions.
+
+This allows a workflow to combine:
+
+```text
+Automation
+    ↓
+Decision
+    ↓
+Policy Check
+    ↓
+┌───────────────┐
+│               │
+▼               ▼
+Approved      Rejected
+│               │
+▼               ▼
+Continue      Rollback /
+              Failure
+```
+
+Approval actions are persisted for later operational review.
+
+---
 
 ## Replay
 
-The runtime stores execution history and checkpoints that can be used to reconstruct workflow activity.
+Valtaris Glue maintains execution history and checkpoints that can be used to reconstruct workflow activity.
 
-Replay is designed primarily as an observational and diagnostic capability rather than an unrestricted duplicate execution mechanism.
+Replay is designed as an observational and diagnostic capability rather than an unrestricted mechanism for blindly re-running side effects.
 
-## Telemetry
+This distinction is important when workflows interact with external systems.
 
-Runtime activity generates structured events and metrics covering areas such as:
+---
 
-- workflow execution;
-- job state;
-- queue pressure;
-- latency;
-- worker activity;
+## Connector Model
+
+The runtime uses connector adapters to isolate external service integrations from orchestration logic.
+
+Current connector work includes integrations such as:
+
+- Stripe;
+- OpenAI;
+- SendGrid.
+
+Mock-capable adapters also support additional development scenarios such as:
+
+- Slack;
+- Twilio;
+- Salesforce.
+
+Connector execution is represented as part of workflow runtime state and telemetry.
+
+---
+
+## Runtime Telemetry
+
+Workflow execution produces operational events and telemetry used by the operator console.
+
+Telemetry can be used to inspect:
+
+- workflow activity;
+- job execution;
+- step timing;
 - failures;
-- approvals;
+- retries;
+- queue pressure;
 - incidents;
 - connector activity.
+
+The goal is to make workflow behavior observable rather than treating execution as a black box.
 
 ---
 
@@ -175,95 +291,122 @@ Runtime activity generates structured events and metrics covering areas such as:
 │                     React Operator Console                  │
 │                                                             │
 │ Command Center · Workflow Studio · Runtime Inspector        │
-│ Approvals · Incidents · Telemetry · Platform Controls       │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               │ Authenticated API
-                               ▼
+│ Approvals · Incidents · Platform Controls · Telemetry       │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           │ Supabase Client / Auth
+                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                       Supabase Runtime                      │
+│                     Supabase Platform                       │
 │                                                             │
-│  PostgreSQL       Edge Functions       Realtime              │
-│  ──────────       ──────────────       ────────              │
-│  Workflows        Execution            Runtime Events        │
-│  Runs             Workers              Dashboard Updates     │
-│  Jobs             Replay               Telemetry              │
-│  Checkpoints      Approvals            Operational State      │
-│  Incidents        Rollback                                     │
+│  ┌────────────────┐  ┌──────────────────┐  ┌──────────────┐ │
+│  │ PostgreSQL     │  │ Edge Functions   │  │ Storage      │ │
+│  │                │  │                  │  │              │ │
+│  │ Workflow State │  │ Workflow Engine  │  │ Runtime Data │ │
+│  │ Jobs           │  │ Workers          │  │ Templates    │ │
+│  │ Events         │  │ Replay           │  │ Metadata     │ │
+│  │ RLS            │  │ Rollback         │  │              │ │
+│  │ Audit Data     │  │ Scheduling       │  │              │ │
+│  └────────────────┘  └──────────────────┘  └──────────────┘ │
 │                                                             │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼
+│                       Supabase Auth                         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Connector / Runtime Layer                 │
+│                     Connector Layer                         │
 │                                                             │
-│ Stripe · OpenAI · SendGrid · Slack · Twilio · Salesforce    │
-│                                                             │
-│                 Adapter-Based Execution                     │
+│ Stripe · OpenAI · SendGrid · Mock Adapters                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Frontend
+## System Components
 
-The operator console is built with React and TypeScript.
+### Frontend
 
-Primary areas include:
+React and TypeScript operator console providing interfaces for:
 
 - Command Center;
 - Workflow Studio;
 - Runtime Inspector;
-- workflow management;
 - approvals;
 - incidents;
+- platform controls;
 - telemetry;
-- platform administration.
+- runtime documentation.
 
-The UI is designed around operational visibility rather than simply providing CRUD interfaces.
+### Backend
+
+Supabase Edge Functions implement workflow execution, worker control, approvals, replay, rollback, scheduling, ingress, and runtime operations.
+
+### Database
+
+PostgreSQL stores:
+
+- workflow definitions;
+- workflow versions;
+- runs;
+- jobs;
+- step results;
+- approvals;
+- incidents;
+- checkpoints;
+- events;
+- telemetry.
+
+### Authentication
+
+Supabase Auth provides authenticated identity and JWT-based access.
+
+Database authorization uses authenticated identity and organization context rather than relying solely on browser-provided tenant identifiers.
+
+### Background Workers
+
+Queue workers claim jobs using transactional database operations, execute eligible workflow steps, renew leases where applicable, persist results, emit telemetry, and route failures through retry or recovery paths.
+
+### Integrations
+
+Connector adapters isolate external service calls from the core orchestration model.
 
 ---
 
-## Backend
+# Data Flow
 
-Supabase provides:
+A workflow can begin through an operator action, scheduler, or external webhook.
 
-- PostgreSQL;
-- Authentication;
-- Row-Level Security;
-- Edge Functions;
-- Realtime;
-- persistent runtime state.
-
-Edge Functions provide execution boundaries for workers, scheduling, replay, rollback, ingress, approvals, and platform operations.
-
----
-
-## Worker Runtime
-
-Workers claim eligible jobs from the durable queue.
-
-The execution model uses PostgreSQL locking and leases to reduce duplicate claims and provide recovery when a worker becomes unavailable.
-
-Conceptually:
+The general execution path is:
 
 ```text
-Queued Job
-    ↓
-Eligibility Check
-    ↓
-Lease / Claim
-    ↓
-Execution
-    ↓
-Persist Result
-    ↓
-Emit Telemetry
-    ↓
+Trigger
+   ↓
+Published Workflow
+   ↓
+Pinned Workflow Version
+   ↓
+Workflow Run
+   ↓
+DAG Expansion
+   ↓
+Durable Jobs
+   ↓
+Worker Claim
+   ↓
+Connector / Workflow Step
+   ↓
+Step Result
+   ↓
+Telemetry + Event
+   ↓
 Unlock Dependencies
+   ↓
+Continue / Retry / Approve / Rollback
+   ↓
+Workflow Completion
 ```
 
-Failures can enter retry, incident, compensation, or dead-letter paths depending on runtime classification.
+The operator console consumes persisted runtime information and realtime updates for monitoring and intervention.
 
 ---
 
@@ -281,29 +424,32 @@ Failures can enter retry, incident, compensation, or dead-letter paths depending
 - Supabase
 - PostgreSQL
 - Supabase Edge Functions
-- Supabase Authentication
+- Supabase Auth
 - Supabase Realtime
 
-## Testing
+## Infrastructure
 
-- Vitest
-- Playwright
+- Database-backed durable queueing
+- Lease-based worker execution
+- Background functions
+- Realtime runtime updates
+
+## AI
+
+- OpenAI connector
+- AI-capable workflow steps
+- Decision metadata and governance traces
+
+AI functionality is treated as a connector/workflow capability rather than the core orchestration engine.
 
 ## Development
 
-- Bun
 - Git
 - GitHub
-
-## Integrations
-
-Current connector-oriented workflows include integrations for:
-
-- Stripe;
-- OpenAI;
-- SendGrid.
-
-Additional adapters and mock-capable integration pathways support future expansion.
+- Bun
+- Vitest
+- Playwright
+- Supabase tooling
 
 ---
 
@@ -344,113 +490,95 @@ project/
 
 # Core Workflows
 
-## Workflow Execution
+## Workflow One — Durable Execution
 
-A published workflow version is selected and pinned when a run begins.
+### Purpose
 
-The runtime expands the workflow definition into durable jobs and executes eligible nodes as their dependencies become satisfied.
+Execute published workflows across dependent steps while retaining durable runtime state.
 
-```text
-Published Workflow
-        ↓
-Pinned Version
-        ↓
-Workflow Run
-        ↓
-DAG Expansion
-        ↓
-Durable Jobs
-        ↓
-Worker Claims
-        ↓
-Step Execution
-        ↓
-Result + Telemetry
-        ↓
-Dependent Jobs
-        ↓
-Completion
-```
+### Process
+
+`execute-workflow` identifies the published workflow version, creates a workflow run, expands the DAG into durable jobs, and workers claim eligible jobs.
+
+### Expected Result
+
+Workflow execution continues through persisted runtime state rather than depending exclusively on the operator's browser session.
 
 ---
 
-## Approval Workflow
+## Workflow Two — Approval-Gated Execution
 
-Certain workflow steps can require human intervention before execution continues.
+### Purpose
 
-```text
-Workflow Step
-      ↓
-Policy Evaluation
-      ↓
-Approval Required?
-   ↙          ↘
- No            Yes
- ↓              ↓
-Continue      Approval Queue
-                 ↓
-          Operator Decision
-             ↙       ↘
-          Approve    Reject
-             ↓         ↓
-         Continue    Failure /
-                     Rollback
-```
+Require human intervention for workflow steps that should not execute automatically.
 
-The purpose is to prevent sensitive or uncertain actions from proceeding without the required governance decision.
+### Process
+
+The runtime evaluates workflow conditions and can route execution into an approval state.
+
+An operator can approve or reject the pending action.
+
+### Expected Result
+
+The workflow either continues through the approved path or enters its configured rejection/failure/recovery path.
 
 ---
 
-## Retry and Recovery
+## Workflow Three — Failure and Recovery
 
-Runtime failures are classified and routed according to execution policy.
+### Purpose
+
+Handle workflow failures without losing runtime state.
+
+### Process
 
 ```text
-Execution Failure
-       ↓
-Error Classification
-       ↓
+Step Failure
+     ↓
+Classify Failure
+     ↓
 Retryable?
-   ↙        ↘
- Yes         No
- ↓            ↓
-Backoff      Incident /
- ↓           Terminal Path
-Retry
- ↓
-Success / Retry Exhausted
-          ↓
-       DLQ / Recovery
+   /       \
+ Yes        No
+  ↓          ↓
+Retry      Failure
+  ↓          ↓
+Execute    Incident /
+Again      Compensation
+             ↓
+          Recovery /
+          Dead Letter
 ```
 
-The runtime persists job state so recovery does not depend exclusively on an active browser session.
+Retry behavior includes persisted job state and backoff handling.
 
 ---
 
-## Rollback and Compensation
+## Workflow Four — Replay
 
-Workflow failures can trigger compensation paths where the workflow defines them.
+### Purpose
 
-The objective is not to claim universal transactional rollback across external systems.
+Inspect the execution history of a workflow run.
 
-Instead, Glue provides an orchestration mechanism for explicit compensation actions defined by the workflow.
+### Process
+
+The runtime uses stored workflow events, checkpoints, and step history to reconstruct execution state.
+
+### Expected Result
+
+Operators can inspect the sequence of workflow activity without depending solely on transient UI state.
 
 ---
 
-## Replay
+## Workflow Five — External Ingress
 
-Replay reconstructs workflow execution from durable state, checkpoints, and event history.
+Workflows can be initiated through supported external triggers such as:
 
-The current design treats replay primarily as an observational and diagnostic capability.
+- webhooks;
+- schedules;
+- operator actions.
 
-This allows operators to investigate:
-
-- what executed;
-- in what order;
-- which dependencies were satisfied;
-- where failures occurred;
-- what telemetry was emitted;
-- what state existed at important checkpoints.
+Ingress is converted into a workflow execution request and processed through the same durable runtime model.
 
 ---
 
@@ -458,95 +586,143 @@ This allows operators to investigate:
 
 ## Authentication
 
-Supabase Authentication provides authenticated identity and JWT-based access.
-
----
+The platform uses Supabase Auth and JWT-based identity for authenticated operator and API access.
 
 ## Authorization
 
-Authorization uses organization-aware access controls and role checks across operational paths.
+Tenant-aware authorization is implemented through:
 
-PostgreSQL Row-Level Security provides a database-level authorization boundary rather than relying solely on frontend behavior.
-
----
-
-## Multi-Tenant Isolation
-
-Operational records are designed around tenant/organization boundaries.
-
-The security model uses:
-
-- organization identifiers;
 - authenticated identity;
-- role-aware access;
+- organization membership;
+- role checks;
 - PostgreSQL RLS;
-- server-side authorization checks.
+- backend authorization logic.
 
-The application does not treat a browser-supplied tenant identifier as sufficient authorization.
-
----
-
-## Secrets
-
-Client-side configuration is limited to values appropriate for browser exposure.
-
-Sensitive connector credentials and service-side secrets are intended to remain server-side.
-
-Service-role credentials must never be exposed through `VITE_` variables or committed to source control.
+The system does not treat a client-supplied organization identifier as sufficient authorization.
 
 ---
 
-## Auditability
+## Row-Level Security
 
-Runtime activity produces structured operational records covering areas such as:
+PostgreSQL RLS provides a database-level authorization boundary for organization-scoped records.
 
-- workflow state;
-- job execution;
-- approvals;
-- incidents;
-- connector activity;
-- telemetry;
-- operator actions.
+The intent is to ensure that authorization remains enforced even when application-level UI restrictions are bypassed.
 
-The project is designed around auditability, but does not claim that every operational event currently forms a formally immutable compliance audit record.
+---
+
+## Data Protection
+
+Client-side environment variables are limited to public configuration required by the browser.
+
+Sensitive integration credentials are intended to remain server-side.
+
+Service-role credentials must never be exposed through client-side `VITE_` variables.
+
+---
+
+## Audit Logging
+
+Operational events can capture information such as:
+
+- actor;
+- organization;
+- workflow;
+- run;
+- job;
+- event type;
+- timestamps;
+- relevant metadata.
+
+Audit and runtime event structures are used to support operational review and troubleshooting.
+
+---
+
+## Input Validation
+
+Validation is performed at important workflow boundaries, including:
+
+- workflow publishing;
+- runtime execution;
+- connector configuration;
+- workflow state transitions.
+
+The objective is to reject invalid workflow operations before they enter durable execution.
 
 ---
 
 ## Error Handling
 
-Runtime errors are classified so the system can distinguish between:
+Failures are classified according to runtime behavior.
 
-- retryable failures;
-- terminal failures;
-- approval-required states;
-- rollback/compensation paths;
-- dead-letter conditions.
+Depending on the failure, the system can:
 
-This prevents every failure from being treated identically.
+- retry;
+- back off;
+- create an incident;
+- request approval;
+- compensate;
+- dead-letter the job.
+
+---
+
+## Compliance Position
+
+Valtaris Glue includes architectural patterns relevant to systems that require:
+
+- tenant isolation;
+- access control;
+- auditability;
+- operational governance;
+- durable execution.
+
+However, the project does **not** claim:
+
+- HIPAA certification;
+- SOC 2 certification;
+- independent security certification;
+- legal compliance for a particular deployment;
+- production authorization for regulated workloads.
+
+Organizations deploying the system in regulated environments would need to perform their own security, privacy, compliance, legal, and operational assessments.
 
 ---
 
 # Database Design
 
-PostgreSQL acts as the durable system of record for workflow execution.
+## Overview
+
+PostgreSQL functions as the durable system of record for workflow definitions, execution state, jobs, checkpoints, approvals, incidents, and runtime events.
+
+## Core Tables
 
 Representative runtime domains include:
 
-| Domain | Representative Data |
-|---|---|
-| Workflow definitions | workflows, versions |
-| Execution | workflow_runs |
-| Queue | workflow_jobs |
-| Step execution | workflow_step_runs |
-| Checkpoints | workflow_checkpoints |
-| Events | workflow_events |
-| Approvals | workflow_approvals |
-| Incidents | workflow_incidents |
-| Telemetry | runtime telemetry / aggregate records |
-| Governance | policies / deployment validation |
-| Connectors | connector configuration and execution metadata |
+- `workflow_runs`
+- `workflow_jobs`
+- `workflow_step_runs`
+- `workflow_checkpoints`
+- `workflow_events`
+- `workflow_approvals`
+- `workflow_incidents`
 
-Core relationships follow the workflow lifecycle:
+Additional tables support:
+
+- workflow definitions;
+- workflow versions;
+- connectors;
+- templates;
+- tenants;
+- users;
+- telemetry;
+- operational configuration.
+
+## Relationships
+
+A workflow run references a specific workflow version.
+
+The workflow run can own multiple jobs, step executions, checkpoints, events, approvals, and incidents.
+
+Conceptually:
 
 ```text
 Workflow
@@ -562,26 +738,45 @@ Workflow Run
    └── Incidents
 ```
 
-The queue design relies on durable job state, eligibility conditions, leases, retry timing, and dependency relationships.
+## Queue Design
+
+Workers claim eligible jobs using transactional database operations.
+
+The queue model incorporates:
+
+- job state;
+- leases;
+- retry timing;
+- dependency conditions;
+- worker ownership;
+- stale-job recovery.
+
+`FOR UPDATE SKIP LOCKED` is used where appropriate to allow multiple workers to claim independent jobs without unnecessarily blocking one another.
 
 ---
 
-# Runtime and API
+# API Overview
 
-Primary runtime functions include:
+## Authentication
 
-| Runtime Function | Purpose |
-|---|---|
-| `execute-workflow` | Starts a workflow run from a published version |
+Authenticated access is required for protected operator and runtime actions.
+
+## Runtime Functions
+
+Representative runtime functions include:
+
+| Function | Purpose |
+| --- | --- |
+| `execute-workflow` | Creates and starts a workflow run |
 | `run-worker` | Claims and executes queued jobs |
-| `approval-decision` | Processes approval decisions |
-| `rollback-executor` | Executes defined compensation paths |
-| `replay-workflow` | Reconstructs workflow execution |
-| `webhook-ingress` | Starts workflows from external events |
-| `scheduler-tick` | Dispatches scheduled workflows |
-| `scale-monitor` | Reports queue pressure and scaling signals |
+| `approval-decision` | Processes approval or rejection |
+| `rollback-executor` | Executes compensation/rollback work |
+| `replay-workflow` | Reconstructs workflow execution history |
+| `webhook-ingress` | Starts workflows from external webhooks |
+| `scheduler-tick` | Triggers scheduled workflows |
+| `scale-monitor` | Reports queue pressure and runtime signals |
 
-The exact function surface may evolve as runtime boundaries are consolidated.
+Exact function behavior and contracts are defined by the implementation in `supabase/functions/`.
 
 ---
 
@@ -590,9 +785,9 @@ The exact function surface may evolve as runtime boundaries are consolidated.
 ## Prerequisites
 
 - Bun
-- Access to a Supabase project or compatible runtime environment
+- Access to a Supabase project or compatible hosted runtime
 
-## Clone
+## Clone Repository
 
 ```bash
 git clone <repository-url>
@@ -619,9 +814,9 @@ bun run dev
 
 # Configuration
 
-Client-side Supabase configuration is documented in `.env.example`.
+Client-side configuration is documented in `.env.example`.
 
-Typical browser-safe configuration includes:
+Representative variables include:
 
 ```text
 VITE_SUPABASE_URL
@@ -629,58 +824,71 @@ VITE_SUPABASE_PUBLISHABLE_KEY
 VITE_SUPABASE_PROJECT_ID
 ```
 
-Backend integrations and sensitive credentials must be configured as server-side secrets.
-
-Supported connector configurations may include:
+Backend integrations such as:
 
 - Stripe;
 - OpenAI;
 - SendGrid;
 - Slack;
 - Twilio;
-- Salesforce.
+- Salesforce;
 
-Where supported, mock-capable adapters can be used for development without live third-party credentials.
+should be configured through server-side secrets where required.
+
+Mock-capable adapters may be used during development when live connector credentials are unavailable.
+
+Sensitive credentials must not be committed to the repository.
 
 ---
 
-# Testing and Verification
+# Testing
 
 ## Unit Tests
 
-Vitest is used for application and runtime testing.
+Vitest provides unit-level coverage for application and runtime behavior.
 
-Typical test areas include:
+Run:
 
-- workflow state;
-- DAG behavior;
-- queue logic;
-- retry handling;
-- runtime utilities;
-- governance logic;
-- connector behavior.
+```bash
+bun run test
+```
 
-## Browser Testing
+## Linting
 
-Playwright is available for browser-level validation of operator workflows.
-
-## Build Validation
-
-The project should be validated with:
+Run:
 
 ```bash
 bun run lint
-bun run test
+```
+
+## Build
+
+Run:
+
+```bash
 bun run build
 ```
 
-Where configured, Playwright workflows can be executed separately.
+## Browser Testing
+
+Playwright configuration is included for browser-level validation where applicable.
+
+## Integration Testing
+
+Runtime behavior can be validated through:
+
+- Supabase Edge Functions;
+- workflow execution paths;
+- connector adapters;
+- approval flows;
+- replay scenarios;
+- failure/retry scenarios.
 
 ## Load Testing
 
-The repository includes runtime tooling for synthetic workload generation and queue behavior analysis.
+The repository includes a `load-harness` runtime component for synthetic workload generation and queue behavior analysis.
 
-Formal production-scale throughput and latency baselines are not currently claimed.
+Formal production-scale throughput and latency baselines have **not** been established and should not be inferred from the presence of the harness.
 
 ---
 
@@ -688,133 +896,110 @@ Formal production-scale throughput and latency baselines are not currently claim
 
 ## Development
 
-Run the Vite development environment against the configured Supabase project.
+Run the Vite development server against a configured Supabase environment.
 
 ## Staging
 
-A staging deployment should use:
+A staging environment can be used to validate:
 
-- a separate Supabase environment;
-- staging secrets;
-- deployed Edge Functions;
-- applied migrations;
-- representative workflow validation.
+- schema migrations;
+- Edge Functions;
+- authentication;
+- RLS;
+- workflow execution;
+- connector behavior;
+- approvals;
+- replay;
+- failure recovery.
 
 ## Production
 
-A production deployment should include:
+The architecture supports deployment to a hosted Supabase-backed environment.
 
-- controlled Supabase infrastructure;
-- server-side secrets;
-- deployed Edge Functions;
-- database migrations;
+However, this repository does **not** claim that the current project represents a commercially deployed production service.
+
+Production deployment would require environment-specific:
+
+- security validation;
+- secrets management;
 - monitoring;
-- worker health checks;
-- queue recovery procedures;
-- operational alerting.
-
-The repository contains deployment-oriented infrastructure, but the project is not represented as a commercially deployed enterprise production platform.
+- load testing;
+- backup/recovery procedures;
+- incident procedures;
+- compliance assessment;
+- operational ownership.
 
 ---
 
-# Performance and Scalability
+# Performance
 
-The runtime is designed with several scalability-oriented characteristics:
+## Current Architecture
 
-- durable queueing;
-- dependency-aware scheduling;
-- worker leasing;
-- retry backoff;
-- background execution;
-- persisted checkpoints;
-- realtime operational updates;
-- queue pressure monitoring;
-- horizontal worker scaling potential.
+The runtime includes several mechanisms intended to support efficient execution:
 
-The architecture is intended to support increased concurrency, but formal production-scale benchmarks have not been established.
+- database-backed queueing;
+- dependency-aware job scheduling;
+- worker leases;
+- `FOR UPDATE SKIP LOCKED`;
+- persisted workflow state;
+- asynchronous background execution;
+- realtime telemetry.
 
-The project therefore does **not** claim specific:
+## Scaling
+
+The architecture can support additional workers processing independent jobs concurrently.
+
+Queue pressure and worker health can be monitored through runtime telemetry and operational controls.
+
+## Current Limitation
+
+Formal performance benchmarks have not yet established specific:
 
 - requests per second;
-- workflow throughput;
-- maximum concurrent workers;
+- workflows per minute;
+- job throughput;
 - p95/p99 latency;
-- multi-region performance.
+- maximum concurrent workers;
+- multi-tenant load limits.
 
-Those measurements remain future validation work.
+Accordingly, no production-scale performance number is claimed.
 
 ---
 
 # Capability Status
 
-Valtaris Glue intentionally distinguishes implemented capabilities from capabilities that still require additional validation or production hardening.
+Valtaris Glue intentionally separates implemented capabilities from capabilities that still require broader verification or development.
 
-| Capability | Current Position |
-|---|---|
-| Durable workflow jobs | Implemented |
+| Area | Status |
+| --- | --- |
+| Durable queue execution | Implemented |
 | Workflow version pinning | Implemented |
 | DAG execution | Implemented |
-| Worker leasing | Implemented |
+| Parallel branches | Implemented |
+| Approval workflows | Implemented |
 | Retry handling | Implemented |
 | Dead-letter handling | Implemented |
-| Checkpoints | Implemented |
-| Approval workflows | Implemented |
-| Rollback / compensation framework | Implemented |
+| Compensation / rollback | Implemented |
 | Runtime telemetry | Implemented |
 | Operator console | Implemented |
-| Replay infrastructure | Implemented |
+| Replay functionality | Implemented |
+| Scheduled workflows | Implemented |
+| Webhook ingress | Implemented |
 | Connector adapter model | Implemented |
-| Multi-tenant architecture | Implemented |
-| RLS architecture | Implemented |
-| RBAC | Implemented |
-| Formal production load benchmarks | Pending |
-| Long-lived production worker infrastructure | Future hardening |
-| Multi-region execution | Roadmap |
-| Enterprise SSO | Roadmap |
-| Comprehensive external compliance audit | Not completed |
+| Stripe connector | Implemented |
+| OpenAI connector | Implemented |
+| SendGrid connector | Implemented |
+| Mock connectors | Implemented |
+| Tenant-aware authorization | Implemented |
+| PostgreSQL RLS | Implemented |
+| Formal load benchmarks | Pending |
+| Long-lived worker hosting | Planned |
+| Multi-region execution | Planned |
+| Expanded connector ecosystem | Planned |
+| Independent security audit | Not completed |
+| HIPAA certification | Not claimed |
+| SOC 2 certification | Not claimed |
 | Commercial production deployment | Not claimed |
-
----
-
-# Known Limitations
-
-## Production Deployment
-
-The repository should not be represented as a commercially deployed enterprise orchestration platform without corresponding deployment evidence.
-
-## Performance
-
-Formal production-scale benchmarking has not been completed.
-
-## Multi-Region
-
-Multi-region execution and regional failover remain future architecture work.
-
-## Compliance
-
-The architecture incorporates security, governance, tenant isolation, and audit-oriented patterns.
-
-However, the project is not represented as:
-
-- SOC 2 certified;
-- HIPAA certified;
-- independently audited;
-- legally compliant for a specific regulated deployment;
-- production-authorized for regulated workloads.
-
-Compliance depends on the complete deployment, organizational controls, operational procedures, and applicable legal requirements.
-
-## External Connectors
-
-Connector support varies by integration.
-
-Live third-party behavior depends on external API credentials, API availability, rate limits, and provider-specific semantics.
-
-## Replay
-
-Replay is designed primarily for reconstruction and analysis.
-
-It should not be interpreted as universal exactly-once re-execution across external systems.
 
 ---
 
@@ -822,88 +1007,86 @@ It should not be interpreted as universal exactly-once re-execution across exter
 
 ## Near Term
 
-- Expand automated runtime verification.
-- Establish formal queue and workflow benchmarks.
+- Expand runtime integration testing.
+- Establish reproducible load-test methodology.
+- Publish measured queue and workflow performance baselines.
 - Expand connector coverage.
-- Strengthen worker lifecycle management.
-- Improve operational alerting.
-- Expand failure and recovery test scenarios.
+- Strengthen operational diagnostics.
+- Continue hardening workflow recovery paths.
 
-## Enterprise Operations
+## Runtime
 
-- SSO;
-- stronger MFA enforcement;
-- advanced organization hierarchies;
-- expanded observability;
-- distributed tracing;
-- operational SLOs;
-- error budgets;
-- enhanced administrative controls.
+- Long-lived worker hosting.
+- More advanced worker coordination.
+- Improved stale-job recovery.
+- Expanded runtime observability.
+- Additional replay diagnostics.
 
-## Scalability
+## Enterprise-Oriented Features
 
-- long-lived worker infrastructure;
-- horizontal worker orchestration;
-- regional execution controls;
-- multi-region failover;
-- higher-cardinality telemetry optimization.
+- SSO integration.
+- Expanded identity providers.
+- More granular organization hierarchies.
+- Advanced audit reporting.
+- Configurable retention policies.
+- Additional administrative controls.
 
-## Connector Ecosystem
+These are planned capabilities, not claims about the current release.
 
-Potential future adapters include:
+## Infrastructure
 
-- Slack;
-- Twilio;
-- Salesforce;
-- additional payment providers;
-- additional communication platforms;
-- internal enterprise APIs.
+- Multi-region execution.
+- Regional worker placement.
+- Improved failover behavior.
+- Expanded backup and recovery automation.
 
-## Intelligence
+## AI
 
-Future development may expand AI-assisted workflow capabilities while maintaining:
+Future work may include:
 
-- governance boundaries;
-- confidence thresholds;
-- human approval;
-- decision traceability.
+- richer AI decision workflows;
+- configurable confidence thresholds;
+- human escalation;
+- expanded AI decision tracing;
+- additional model providers.
 
-AI is treated as an orchestration capability rather than an uncontrolled replacement for deterministic workflow rules.
+AI remains one capability within the broader orchestration runtime rather than the definition of the platform itself.
 
 ---
 
 # Documentation
 
-| Document | Purpose |
-|---|---|
-| `docs/runtime/` | Runtime architecture, workers, orchestration, replay, and telemetry |
-| `docs/platform/` | Platform capabilities, templates, deployment, and operational guidance |
-| `docs/STATUS.md` | Current capability and implementation status |
-| `CHANGELOG.md` | Project delivery history and evolution |
+| Document | Description |
+| --- | --- |
+| Runtime Documentation | Workflow execution, workers, replay, telemetry, and runtime behavior |
+| Platform Documentation | Templates, deployment, onboarding, and platform workflows |
+| `STATUS.md` | Current, partial, and planned capabilities |
+| `CHANGELOG.md` | Delivery history and project evolution |
 
 ---
 
 # Screenshots
 
-Screenshots and architecture diagrams can be added here to demonstrate:
+Screenshots and architecture diagrams can be added here as the visual demonstration package is finalized.
 
-- Command Center;
-- Workflow Studio;
-- Runtime Inspector;
+Recommended evidence includes:
+
+- operator command center;
+- workflow studio;
 - workflow execution;
-- approvals;
-- incidents;
-- telemetry;
-- connector configuration;
-- replay workflows.
-
-The primary technical evidence remains the source code, database migrations, runtime functions, tests, and documented architecture.
+- runtime inspector;
+- approval workflow;
+- incident view;
+- telemetry dashboard;
+- replay interface;
+- database architecture;
+- repository structure.
 
 ---
 
 # Engineering Approach
 
-Valtaris Glue has been developed around an iterative engineering process:
+Valtaris Glue is developed using an iterative engineering process:
 
 ```text
 Design
@@ -914,7 +1097,7 @@ Test
   ↓
 Inspect Runtime Behavior
   ↓
-Identify Failure Modes
+Identify Gaps
   ↓
 Remediate
   ↓
@@ -927,30 +1110,25 @@ The project emphasizes:
 
 - durable state over transient browser state;
 - explicit workflow versions;
-- database-backed execution;
-- deterministic dependency handling;
+- deterministic execution boundaries;
+- database-enforced authorization;
 - observable runtime behavior;
-- controlled retries;
-- explicit recovery paths;
-- tenant-aware authorization;
-- evidence-based capability claims.
+- recoverable failures;
+- clear separation between implemented and planned capabilities.
 
 ---
 
 # Contributing
 
-For development changes:
+Follow the existing repository conventions for:
 
-1. Create a focused feature or fix branch.
-2. Preserve existing runtime boundaries.
-3. Add tests for meaningful behavior changes.
-4. Preserve tenant authorization.
-5. Avoid exposing server-side secrets.
-6. Validate workflow changes against existing runtime behavior.
-7. Update documentation when runtime contracts change.
-8. Use pull requests for reviewable changes.
+- TypeScript;
+- React;
+- Supabase Edge Functions;
+- PostgreSQL;
+- runtime documentation.
 
-Recommended validation:
+Before submitting changes where applicable, run:
 
 ```bash
 bun run lint
@@ -958,13 +1136,26 @@ bun run test
 bun run build
 ```
 
+Keep changes scoped and reviewable.
+
+Changes involving workflow execution should preserve:
+
+- workflow versioning;
+- tenant boundaries;
+- durable state;
+- retry semantics;
+- authorization;
+- runtime observability.
+
+Do not weaken authorization or persistence guarantees simply to make a test pass.
+
 ---
 
 # License
 
-No explicit license is currently claimed unless a license file is present in the repository.
+No explicit license file is currently present in the repository.
 
-Define the project license before external distribution.
+Define a project license before external distribution.
 
 ---
 
@@ -972,16 +1163,12 @@ Define the project license before external distribution.
 
 **George Rios**
 
-Founder & Software Engineer
+Independent Software Engineer
 
 **Valtaris Technologies**
 
 ---
 
-# Project Positioning
+# Acknowledgements
 
-Valtaris Glue is an independent engineering project focused on durable workflow orchestration, governed automation, replayable runtime state, connector execution, and operational observability.
-
-It is intended to demonstrate the engineering patterns required to build reliable workflow infrastructure rather than claim that every enterprise production concern has already been solved.
-
-```
+Built with React, Vite, Tailwind CSS, Supabase, PostgreSQL, Supabase Edge Functions, Vitest, Playwright, and the open-source ecosystem supporting the project's runtime and development tooling.
