@@ -1,0 +1,73 @@
+// supabase/functions/idempotency/index.ts
+// Valtaris Glue — Idempotency Enforcement Engine
+//
+// Glue must guarantee that connector calls are safe under:
+//   - retries
+//   - worker crashes
+//   - backoff
+//   - replay
+//   - compensation
+//   - network failures
+//
+// This engine stores idempotency keys and prevents duplicate execution.
+//
+// Authority chain:
+//   run-worker → execute-step → idempotency registry → connector
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { idempotencyKey, result } = body;
+
+  if (!idempotencyKey) {
+    return new Response("missing-idempotency-key", { status: 400 });
+  }
+
+  // 1. Check if key already exists
+  const { data: existing } = await supabase
+    .from("workflow_idempotency")
+    .select("*")
+    .eq("key", idempotencyKey)
+    .single();
+
+  if (existing) {
+    // Return stored result — prevents duplicate execution
+    return new Response(
+      JSON.stringify({
+        idempotencyKey,
+        result: existing.result,
+        status: "duplicate",
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 2. Store new idempotency entry
+  const { error } = await supabase
+    .from("workflow_idempotency")
+    .insert({
+      key: idempotencyKey,
+      result,
+      created_at: new Date().toISOString(),
+    });
+
+  if (error) {
+    return new Response("idempotency-store-failed", { status: 500 });
+  }
+
+  return new Response(
+    JSON.stringify({
+      idempotencyKey,
+      result,
+      status: "stored",
+    }),
+    { status: 200 }
+  );
+});
