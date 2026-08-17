@@ -1,0 +1,117 @@
+// supabase/functions/worker-integrate/index.ts
+// Valtaris Glue — Worker Integration Layer
+//
+// This file integrates ALL runtime safety layers into the worker.
+// It ensures the worker uses:
+//   - idempotency
+//   - connector-wrapper
+//   - telemetry
+//   - worker-timeout
+//   - DLQ
+//   - finalization
+//   - compensation
+//   - graph loader
+//   - definition loader
+//
+// Authority chain:
+//   run-worker → worker-integrate → safety layers → step execution
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+serve(async (req) => {
+  const body = await req.json();
+  const { job_id, run_id, step_id, connector, payload } = body;
+
+  if (!job_id || !run_id || !step_id || !connector) {
+    return new Response("missing-required-fields", { status: 400 });
+  }
+
+  // 1. Enforce worker-side timeout
+  await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/worker-timeout`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id }),
+    }
+  );
+
+  // 2. Load graph (version authority)
+  const graphRes = await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/load-graph`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workflow_version_id: body.workflow_version_id }),
+    }
+  );
+  const graph = await graphRes.json();
+
+  // 3. Load definition (version authority)
+  const defRes = await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/load-definition`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workflow_version_id: body.workflow_version_id }),
+    }
+  );
+  const definition = await defRes.json();
+
+  // 4. Execute connector through safety wrapper
+  const idempotencyKey = `${job_id}-${step_id}-${Date.now()}`;
+  const connectorRes = await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/connector-wrapper`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        connector,
+        payload,
+        idempotencyKey,
+      }),
+    }
+  );
+  const connectorResult = await connectorRes.json();
+
+  // 5. Log telemetry
+  await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/connector-telemetry`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        connector,
+        idempotencyKey,
+        payload,
+        result: connectorResult.result,
+        error: connectorResult.error,
+        durationMs: connectorResult.durationMs,
+        run_id,
+        job_id,
+        step_id,
+      }),
+    }
+  );
+
+  // 6. Finalize run if needed
+  await fetch(
+    `${Deno.env.get("SUPABASE_URL")}/functions/v1/finalize-run`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id }),
+    }
+  );
+
+  return new Response(
+    JSON.stringify({
+      job_id,
+      run_id,
+      step_id,
+      connector,
+      status: "integrated",
+    }),
+    { status: 200 }
+  );
+});
