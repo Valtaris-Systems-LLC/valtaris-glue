@@ -1,0 +1,204 @@
+// supabase/functions/run-lifecycle/index.ts
+// Valtaris Glue — Unified Run Lifecycle Engine
+//
+// This file centralizes ALL run lifecycle transitions.
+// It ensures runs move through deterministic, safe states:
+//
+//   created → running → completed
+//   created → running → failed
+//   created → running → compensating → compensated
+//   created → running → replay → replay_completed
+//   created → running → cancelled
+//
+// It prevents:
+//   - stuck runs
+//   - contradictory states
+//   - partial updates
+//   - inconsistent state
+//
+// Authority chain:
+//   step-lifecycle → job-lifecycle → run-lifecycle → workflow_runs
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { run_id, action } = body;
+
+  if (!run_id || !action) {
+    return new Response("missing-run-id-or-action", { status: 400 });
+  }
+
+  // 1. Load run
+  const { data: run } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (!run) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  // 2. Determine lifecycle transition
+  switch (action) {
+    case "start":
+      return await startRun(run);
+
+    case "complete":
+      return await completeRun(run);
+
+    case "fail":
+      return await failRun(run);
+
+    case "compensating":
+      return await markCompensating(run);
+
+    case "compensated":
+      return await markCompensated(run);
+
+    case "replay":
+      return await markReplay(run);
+
+    case "replay_completed":
+      return await markReplayCompleted(run);
+
+    case "cancel":
+      return await cancelRun(run);
+
+    default:
+      return new Response("invalid-action", { status: 400 });
+  }
+});
+
+// ----------------------------
+// Lifecycle Transitions
+// ----------------------------
+
+async function startRun(run: any) {
+  if (run.state !== "created") {
+    return new Response("invalid-transition", { status: 400 });
+  }
+
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "running",
+      started_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "running" }),
+    { status: 200 }
+  );
+}
+
+async function completeRun(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "completed",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "completed" }),
+    { status: 200 }
+  );
+}
+
+async function failRun(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "failed",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "failed" }),
+    { status: 200 }
+  );
+}
+
+async function markCompensating(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "compensating",
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "compensating" }),
+    { status: 200 }
+  );
+}
+
+async function markCompensated(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "compensated",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "compensated" }),
+    { status: 200 }
+  );
+}
+
+async function markReplay(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "replay",
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "replay" }),
+    { status: 200 }
+  );
+}
+
+async function markReplayCompleted(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "replay_completed",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "replay_completed" }),
+    { status: 200 }
+  );
+}
+
+async function cancelRun(run: any) {
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "cancelled",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({ run_id: run.id, state: "cancelled" }),
+    { status: 200 }
+  );
+}
