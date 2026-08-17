@@ -1,0 +1,112 @@
+// supabase/functions/connector-registry/index.ts
+// Valtaris Glue — Connector Registry
+//
+// This file defines the SINGLE authoritative registry of all connectors.
+// Every connector must be declared here.
+//
+// Registry entries include:
+//   - name
+//   - category
+//   - description
+//   - required payload fields
+//   - safety flags
+//
+// This enables:
+//   - validation
+//   - introspection
+//   - documentation
+//   - safety enforcement
+//   - consistent dispatch
+//
+// Authority chain:
+//   execute-step → connector-wrapper → connector-registry → connector
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+serve(async () => {
+  const registry = [
+    // ----------------------------
+    // HTTP Connectors
+    // ----------------------------
+    {
+      name: "http.get",
+      category: "http",
+      description: "Perform an HTTP GET request",
+      required: ["url"],
+      safe: true,
+    },
+    {
+      name: "http.post",
+      category: "http",
+      description: "Perform an HTTP POST request",
+      required: ["url", "body"],
+      safe: true,
+    },
+    {
+      name: "http.put",
+      category: "http",
+      description: "Perform an HTTP PUT request",
+      required: ["url", "body"],
+      safe: true,
+    },
+    {
+      name: "http.delete",
+      category: "http",
+      description: "Perform an HTTP DELETE request",
+      required: ["url"],
+      safe: true,
+    },
+
+    // ----------------------------
+    // Supabase Connectors
+    // ----------------------------
+    {
+      name: "supabase.select",
+      category: "supabase",
+      description: "Select rows from a Supabase table",
+      required: ["table", "filters"],
+      safe: true,
+    },
+    {
+      name: "supabase.insert",
+      category: "supabase",
+      description: "Insert rows into a Supabase table",
+      required: ["table", "values"],
+      safe: true,
+    },
+    {
+      name: "supabase.update",
+      category: "supabase",
+      description: "Update rows in a Supabase table",
+      required: ["table", "filters", "values"],
+      safe: true,
+    },
+    {
+      name: "supabase.delete",
+      category: "supabase",
+      description: "Delete rows from a Supabase table",
+      required: ["table", "filters"],
+      safe: true,
+    },
+
+    // ----------------------------
+    // AI Connectors
+    // ----------------------------
+    {
+      name: "ai.generate",
+      category: "ai",
+      description: "Generate text using an AI model",
+      required: ["prompt"],
+      safe: true,
+    },
+  ];
+
+  return new Response(
+    JSON.stringify({
+      connectors: registry,
+      count: registry.length,
+      status: "ok",
+    }),
+    { status: 200 }
+  );
+});
