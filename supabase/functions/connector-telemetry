@@ -1,0 +1,81 @@
+// supabase/functions/connector-telemetry/index.ts
+// Valtaris Glue — Connector Logging & Telemetry
+//
+// This file records ALL connector activity:
+//   - connector name
+//   - idempotency key
+//   - payload
+//   - result
+//   - error
+//   - duration
+//   - timestamp
+//   - run_id
+//   - job_id
+//   - step_id
+//
+// This enables:
+//   - debugging
+//   - observability
+//   - audit trails
+//   - replay safety
+//   - compensation analysis
+//   - performance metrics
+//
+// Authority chain:
+//   connector-wrapper → connector-telemetry → workflow_logs
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const {
+    connector,
+    idempotencyKey,
+    payload,
+    result,
+    error,
+    durationMs,
+    run_id,
+    job_id,
+    step_id,
+  } = body;
+
+  if (!connector || !idempotencyKey) {
+    return new Response("missing-connector-or-idempotency-key", { status: 400 });
+  }
+
+  // 1. Insert telemetry log
+  const { error: logErr } = await supabase
+    .from("workflow_connector_logs")
+    .insert({
+      connector,
+      idempotency_key: idempotencyKey,
+      payload,
+      result,
+      error,
+      duration_ms: durationMs,
+      run_id,
+      job_id,
+      step_id,
+      created_at: new Date().toISOString(),
+    });
+
+  if (logErr) {
+    return new Response("telemetry-log-failed", { status: 500 });
+  }
+
+  return new Response(
+    JSON.stringify({
+      connector,
+      idempotencyKey,
+      status: "logged",
+    }),
+    { status: 200 }
+  );
+});
