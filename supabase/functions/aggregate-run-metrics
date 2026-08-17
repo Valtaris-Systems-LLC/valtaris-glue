@@ -1,0 +1,80 @@
+// supabase/functions/aggregate-run-metrics/index.ts
+// Valtaris Glue — Run Metrics Aggregator
+//
+// This file aggregates metrics at the workflow run level.
+// It produces analytics such as:
+//   - run duration
+//   - run success rate
+//   - run failure rate
+//   - compensation rate
+//   - DLQ rate
+//   - stuck-run frequency
+//   - throughput (runs/minute)
+//   - latency distribution
+//
+// Authority chain:
+//   collect-metrics → aggregate-run-metrics → dashboards
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async () => {
+  // 1. Load all runs
+  const { data: runs } = await supabase
+    .from("workflow_runs")
+    .select("*");
+
+  // 2. Load metrics
+  const { data: metrics } = await supabase
+    .from("workflow_metrics")
+    .select("*");
+
+  const aggregates = [];
+
+  for (const run of runs) {
+    const runMetrics = metrics.filter((m: any) => m.run_id === run.id);
+
+    const start = new Date(run.created_at).getTime();
+    const end = new Date(run.completed_at ?? Date.now()).getTime();
+    const durationMs = end - start;
+
+    const success = run.state === "completed";
+    const failed = run.state === "failed";
+    const compensated = run.state === "compensated";
+    const replayed = run.state === "replay_completed";
+
+    const dlqCount = runMetrics.filter((m: any) => m.event === "dlq").length;
+    const stuckCount = runMetrics.filter((m: any) => m.event === "stuck-run").length;
+    const repairCount = runMetrics.filter((m: any) => m.event === "repair").length;
+
+    aggregates.push({
+      run_id: run.id,
+      workflow_version_id: run.workflow_version_id,
+      duration_ms: durationMs,
+      success,
+      failed,
+      compensated,
+      replayed,
+      dlq_count: dlqCount,
+      stuck_count: stuckCount,
+      repair_count: repairCount,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  // 3. Store aggregated metrics
+  await supabase.from("workflow_run_metrics").insert(aggregates);
+
+  return new Response(
+    JSON.stringify({
+      status: "run-metrics-aggregated",
+      count: aggregates.length,
+    }),
+    { status: 200 }
+  );
+});
