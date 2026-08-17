@@ -1,0 +1,93 @@
+// supabase/functions/worker-timeout/index.ts
+// Valtaris Glue — Worker-Side Timeout Enforcement
+//
+// This protects the ENTIRE step execution pipeline.
+// If the worker stalls or hangs, Glue must:
+//   - abort the step
+//   - fail the job
+//   - send to DLQ
+//   - finalize the run
+//
+// This prevents:
+//   - stuck jobs
+//   - stuck runs
+//   - partial execution
+//   - infinite hangs
+//
+// Authority chain:
+//   run-worker → worker-timeout → dead-letter → finalize-run
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+// Worker timeout for entire step execution
+const WORKER_TIMEOUT_MS = 1000 * 30; // 30 seconds
+
+serve(async (req) => {
+  const body = await req.json();
+  const { job_id } = body;
+
+  if (!job_id) {
+    return new Response("missing-job-id", { status: 400 });
+  }
+
+  // 1. Load job
+  const { data: job } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", job_id)
+    .single();
+
+  if (!job) {
+    return new Response("job-not-found", { status: 404 });
+  }
+
+  // 2. Check if job exceeded worker timeout
+  const startedAt = new Date(job.claimed_at).getTime();
+  const now = Date.now();
+
+  if (now - startedAt < WORKER_TIMEOUT_MS) {
+    return new Response("job-within-timeout", { status: 200 });
+  }
+
+  // 3. Mark job as failed due to timeout
+  await supabase
+    .from("workflow_jobs")
+    .update({
+      state: "failed",
+      error: "worker-timeout",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", job_id);
+
+  // 4. Insert DLQ entry
+  await supabase.from("workflow_dead_letters").insert({
+    run_id: job.run_id,
+    workflow_version_id: job.workflow_version_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    attempt: job.attempt,
+    payload: job.payload,
+    error: "worker-timeout",
+    created_at: new Date().toISOString(),
+  });
+
+  // 5. Finalize run
+  await supabase.functions.invoke("finalize-run", {
+    body: { run_id: job.run_id },
+  });
+
+  return new Response(
+    JSON.stringify({
+      job_id,
+      run_id: job.run_id,
+      status: "worker-timeout",
+    }),
+    { status: 200 }
+  );
+});
