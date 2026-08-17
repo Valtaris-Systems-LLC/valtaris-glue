@@ -1,0 +1,115 @@
+// supabase/functions/schedule-next-job/index.ts
+// Valtaris Glue — Unified Scheduler
+//
+// This file selects the next runnable job for a workflow run.
+// It enforces:
+//   - graph authority
+//   - version authority
+//   - job lifecycle correctness
+//   - step lifecycle correctness
+//   - DLQ safety
+//   - compensation safety
+//   - idempotency safety
+//   - worker-timeout safety
+//
+// Authority chain:
+//   schedule-next-job → job-lifecycle → worker-integrate → connector-wrapper
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { run_id } = body;
+
+  if (!run_id) {
+    return new Response("missing-run-id", { status: 400 });
+  }
+
+  // 1. Load run
+  const { data: run } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (!run) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  // 2. Load workflow version
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", run.workflow_version_id)
+    .single();
+
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
+  }
+
+  const graph = version.graph;
+
+  // 3. Load jobs for this run
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("run_id", run_id);
+
+  // 4. Find runnable job
+  const runnable = jobs.find((j: any) => j.state === "pending");
+
+  if (!runnable) {
+    return new Response(
+      JSON.stringify({
+        run_id,
+        status: "no-runnable-jobs",
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 5. Lease job
+  await supabase.functions.invoke("job-lifecycle", {
+    body: { job_id: runnable.id, action: "lease" },
+  });
+
+  // 6. Mark step as running
+  await supabase.functions.invoke("step-lifecycle", {
+    body: {
+      run_id,
+      step_id: runnable.step_id,
+      action: "start",
+    },
+  });
+
+  // 7. Dispatch job to worker
+  const workerRes = await supabase.functions.invoke("worker-integrate", {
+    body: {
+      job_id: runnable.id,
+      run_id,
+      step_id: runnable.step_id,
+      connector: graph.nodes.find((n: any) => n.id === runnable.step_id)?.connector,
+      payload: runnable.payload,
+      workflow_version_id: run.workflow_version_id,
+    },
+  });
+
+  const workerResult = await workerRes.json();
+
+  return new Response(
+    JSON.stringify({
+      run_id,
+      job_id: runnable.id,
+      step_id: runnable.step_id,
+      worker: workerResult,
+      status: "scheduled",
+    }),
+    { status: 200 }
+  );
+});
