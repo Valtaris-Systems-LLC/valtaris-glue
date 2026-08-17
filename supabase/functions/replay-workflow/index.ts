@@ -1,244 +1,138 @@
 // supabase/functions/replay-workflow/index.ts
-// Valtaris Glue — Workflow Replay Engine
+// Valtaris Glue — Observational Replay Engine
 //
-// This Edge Function replays a workflow run deterministically.
-// It is responsible for:
-// - Validating workflow run existence
-// - Resetting job state
-// - Re-enqueuing initial step
-// - Emitting replay events
-// - Preserving lineage for auditability
+// Safe replay model:
+//   original workflow_run
+//       → workflow_version (immutable)
+//       → workflow_step_runs (evidence)
+//       → checkpoints/snapshots
+//       → NEW replay workflow_run
+//       → reconstructed timeline/state
 //
-// Replay does NOT mutate workflow definitions.
-// Replay does NOT skip steps.
-// Replay always starts from step 1.
+// Replay NEVER:
+//   - re-executes connectors
+//   - mutates the original run
+//   - deletes jobs
+//   - requeues steps
+//
+// Replay ALWAYS:
+//   - creates a new run
+//   - uses observational evidence
+//   - reconstructs state deterministically
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.47.0";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-interface ReplayRequest {
-  workflowRunId: string;
-  reason?: string;
-}
-
-function getSupabase() {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-  if (!url || !key) {
-    throw new Error("Missing Supabase environment variables");
-  }
-
-  return createClient(url, key, { auth: { persistSession: false } });
-}
-
-async function loadWorkflowRun(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-) {
-  const { data, error } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", workflowRunId)
-    .single();
-
-  if (error) {
-    console.error("Error loading workflow run:", error);
-    return null;
-  }
-
-  return data;
-}
-
-async function loadWorkflowDefinition(
-  supabase: ReturnType<typeof getSupabase>,
-  definitionId: string,
-) {
-  const { data, error } = await supabase
-    .from("workflow_definitions")
-    .select("*")
-    .eq("id", definitionId)
-    .single();
-
-  if (error) {
-    console.error("Error loading workflow definition:", error);
-    return null;
-  }
-
-  return data;
-}
-
-async function clearExistingJobs(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-) {
-  const { error } = await supabase
-    .from("workflow_jobs")
-    .delete()
-    .eq("workflow_run_id", workflowRunId);
-
-  if (error) {
-    console.error("Error clearing workflow jobs:", error);
-    return false;
-  }
-
-  return true;
-}
-
-async function enqueueInitialJob(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-  step: any,
-) {
-  const now = new Date().toISOString();
-
-  const { error } = await supabase.from("workflow_jobs").insert({
-    workflow_run_id: workflowRunId,
-    step_id: step.id,
-    status: "queued",
-    attempts: 0,
-    max_attempts: 5,
-    next_run_at: now,
-    connector_key: step.connectorKey,
-    payload: {},
-  });
-
-  if (error) {
-    console.error("Error enqueuing initial job:", error);
-    return false;
-  }
-
-  return true;
-}
-
-async function emitReplayEvent(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-  reason: string | undefined,
-) {
-  const { error } = await supabase.from("workflow_events").insert({
-    workflow_run_id: workflowRunId,
-    workflow_job_id: null,
-    step_id: null,
-    kind: "workflow_replay_started",
-    payload: {
-      reason: reason ?? "unspecified",
-      replayedAt: new Date().toISOString(),
-    },
-  });
-
-  if (error) {
-    console.error("Error emitting replay event:", error);
-  }
-}
-
-async function resetWorkflowRunStatus(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-  firstStepId: string,
-) {
-  const { error } = await supabase
-    .from("workflow_runs")
-    .update({
-      status: "pending",
-      current_step_id: firstStepId,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", workflowRunId);
-
-  if (error) {
-    console.error("Error resetting workflow run status:", error);
-    return false;
-  }
-
-  return true;
-}
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
 
 serve(async (req) => {
-  if (req.method !== "POST") {
-    return new Response(
-      JSON.stringify({ error: "Method not allowed" }),
-      { status: 405, headers: { "Content-Type": "application/json" } },
-    );
+  const { run_id } = await req.json();
+
+  if (!run_id) {
+    return new Response("missing-run-id", { status: 400 });
   }
 
-  let body: ReplayRequest;
+  // 1. Load original run
+  const { data: original } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
 
-  try {
-    body = await req.json();
-  } catch {
-    return new Response(
-      JSON.stringify({ error: "Invalid JSON payload" }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+  if (!original) {
+    return new Response("run-not-found", { status: 404 });
   }
 
-  const supabase = getSupabase();
+  // 2. Load workflow version (immutable authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", original.workflow_version_id)
+    .single();
 
-  const run = await loadWorkflowRun(supabase, body.workflowRunId);
-
-  if (!run) {
-    return new Response(
-      JSON.stringify({ error: "Workflow run not found" }),
-      { status: 404, headers: { "Content-Type": "application/json" } },
-    );
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
   }
 
-  const definition = await loadWorkflowDefinition(
-    supabase,
-    run.workflow_definition_id,
-  );
+  // 3. Load step runs (observational evidence)
+  const { data: steps } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", run_id)
+    .order("created_at", { ascending: true });
 
-  if (!definition || !definition.steps || definition.steps.length === 0) {
-    return new Response(
-      JSON.stringify({ error: "Workflow definition invalid" }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+  // 4. Load checkpoints/snapshots
+  const { data: snapshots } = await supabase
+    .from("workflow_snapshots")
+    .select("*")
+    .eq("run_id", run_id)
+    .order("timestamp", { ascending: true });
+
+  // 5. Create NEW replay run
+  const { data: replayRun, error: replayErr } = await supabase
+    .from("workflow_runs")
+    .insert({
+      workflow_version_id: original.workflow_version_id,
+      state: "replay",
+      original_run_id: original.id,
+      started_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (replayErr) {
+    return new Response("replay-run-create-failed", { status: 500 });
   }
 
-  const firstStep = definition.steps[0];
+  // 6. Reconstruct timeline
+  const timeline = [];
 
-  const cleared = await clearExistingJobs(supabase, run.id);
-  if (!cleared) {
-    return new Response(
-      JSON.stringify({ error: "Failed to clear existing jobs" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
+  for (const step of steps) {
+    timeline.push({
+      type: "step",
+      step_id: step.step_id,
+      state: step.state,
+      started_at: step.started_at,
+      completed_at: step.completed_at,
+      result: step.result,
+    });
   }
 
-  const reset = await resetWorkflowRunStatus(
-    supabase,
-    run.id,
-    firstStep.id,
-  );
-
-  if (!reset) {
-    return new Response(
-      JSON.stringify({ error: "Failed to reset workflow run" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
+  for (const snap of snapshots) {
+    timeline.push({
+      type: "snapshot",
+      snapshot_id: snap.id,
+      timestamp: snap.timestamp,
+      state: snap.state,
+    });
   }
 
-  const enqueued = await enqueueInitialJob(
-    supabase,
-    run.id,
-    firstStep,
-  );
+  // 7. Store replay timeline
+  await supabase.from("workflow_replays").insert({
+    replay_run_id: replayRun.id,
+    original_run_id: original.id,
+    timeline,
+    created_at: new Date().toISOString(),
+  });
 
-  if (!enqueued) {
-    return new Response(
-      JSON.stringify({ error: "Failed to enqueue initial job" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  await emitReplayEvent(supabase, run.id, body.reason);
+  // 8. Mark replay complete
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "replay_completed",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", replayRun.id);
 
   return new Response(
     JSON.stringify({
-      workflowRunId: run.id,
-      status: "replay_queued",
+      replay_run_id: replayRun.id,
+      timeline_count: timeline.length,
+      status: "ok",
     }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
+    { status: 200 }
   );
 });
