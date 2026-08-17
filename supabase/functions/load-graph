@@ -1,0 +1,65 @@
+// supabase/functions/load-graph/index.ts
+// Valtaris Glue — Unified Graph Loader
+//
+// This replaces ALL legacy graph-loading paths.
+// It enforces strict version authority:
+//
+//   workflow_version_id → workflow_versions.graph
+//
+// No fallback to workflow_dags.
+// No fallback to workflow_definitions.
+// No inline JSON graphs.
+// No ad-hoc reconstruction.
+//
+// This function is used by:
+//   - execute-workflow
+//   - run-worker
+//   - replay-workflow
+//
+// It guarantees that every workflow execution path
+// uses the SAME immutable graph.
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { workflow_version_id } = body;
+
+  if (!workflow_version_id) {
+    return new Response("missing-workflow-version-id", { status: 400 });
+  }
+
+  // 1. Load workflow version (single authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", workflow_version_id)
+    .single();
+
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
+  }
+
+  // 2. Validate graph structure
+  const graph = version.graph;
+
+  if (!graph || !graph.nodes || !graph.edges) {
+    return new Response("invalid-graph", { status: 500 });
+  }
+
+  // 3. Return immutable graph
+  return new Response(
+    JSON.stringify({
+      workflow_version_id,
+      graph,
+      status: "ok",
+    }),
+    { status: 200 }
+  );
+});
