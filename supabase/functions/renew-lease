@@ -1,0 +1,60 @@
+// supabase/functions/renew-lease/index.ts
+// Valtaris Glue — Worker Lease Renewal Engine
+//
+// Durable execution requires lease renewal.
+// Workers must periodically extend their lease on claimed jobs.
+//
+// Authority chain:
+//   workflow_jobs.claimed_by → worker_id
+//   workflow_jobs.lease_expires_at → extended
+//
+// If a worker fails to renew its lease:
+//   - job becomes available again
+//   - another worker can safely claim it
+//
+// This prevents:
+//   - orphaned jobs
+//   - stuck runs
+//   - double execution
+//   - inconsistent state
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const LEASE_MS = 1000 * 30; // 30 seconds
+
+serve(async (req) => {
+  const body = await req.json();
+  const { worker_id } = body;
+
+  if (!worker_id) {
+    return new Response("missing-worker-id", { status: 400 });
+  }
+
+  // 1. Renew leases for all jobs claimed by this worker
+  const { error } = await supabase
+    .from("workflow_jobs")
+    .update({
+      lease_expires_at: new Date(Date.now() + LEASE_MS).toISOString(),
+    })
+    .eq("claimed_by", worker_id)
+    .eq("state", "running");
+
+  if (error) {
+    return new Response("lease-renewal-failed", { status: 500 });
+  }
+
+  return new Response(
+    JSON.stringify({
+      worker_id,
+      renewed_until: new Date(Date.now() + LEASE_MS).toISOString(),
+      status: "ok",
+    }),
+    { status: 200 }
+  );
+});
