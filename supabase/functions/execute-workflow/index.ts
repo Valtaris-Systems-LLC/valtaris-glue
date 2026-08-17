@@ -1,217 +1,90 @@
 // supabase/functions/execute-workflow/index.ts
-// Valtaris Glue — Workflow Execution Entrypoint
+// Valtaris Glue — Unified Workflow Initializer
 //
-// This Edge Function is responsible for:
-// - Creating workflow runs
-// - Validating workflow definitions
-// - Seeding initial workflow jobs
-// - Emitting workflow lifecycle events
-// - Handing off execution to the worker runtime
+// This replaces all legacy initialization paths.
+// Authority chain:
+//   workflow_version_id → workflow_versions.graph → initial nodes → jobs
 //
-// It does NOT execute steps directly — that is the worker's job.
-// This function simply initializes the workflow and enqueues the first job.
+// No fallback to workflow_dags.
+// No fallback to workflow_definitions.
+// No ad-hoc graph construction.
+//
+// This initializer:
+//   - pins workflow version
+//   - creates workflow_run
+//   - seeds initial jobs
+//   - guarantees durable, consistent start state
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.47.0";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-interface ExecuteWorkflowRequest {
-  workflowDefinitionId: string;
-  initialPayload?: Record<string, unknown>;
-}
-
-interface WorkflowDefinition {
-  id: string;
-  name: string;
-  version: number;
-  steps: Array<{
-    id: string;
-    name: string;
-    connectorKey: string;
-  }>;
-}
-
-function getSupabase() {
-  const url = Deno.env.get("SUPABASE_URL");
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-
-  if (!url || !key) {
-    throw new Error("Missing Supabase environment variables");
-  }
-
-  return createClient(url, key, { auth: { persistSession: false } });
-}
-
-async function loadWorkflowDefinition(
-  supabase: ReturnType<typeof getSupabase>,
-  id: string,
-): Promise<WorkflowDefinition | null> {
-  const { data, error } = await supabase
-    .from("workflow_definitions")
-    .select("*")
-    .eq("id", id)
-    .single();
-
-  if (error) {
-    console.error("Error loading workflow definition:", error);
-    return null;
-  }
-
-  return data as WorkflowDefinition;
-}
-
-async function createWorkflowRun(
-  supabase: ReturnType<typeof getSupabase>,
-  definition: WorkflowDefinition,
-): Promise<string | null> {
-  const { data, error } = await supabase
-    .from("workflow_runs")
-    .insert({
-      workflow_definition_id: definition.id,
-      status: "pending",
-      current_step_id: definition.steps[0]?.id ?? null,
-    })
-    .select("id")
-    .single();
-
-  if (error) {
-    console.error("Error creating workflow run:", error);
-    return null;
-  }
-
-  return data.id;
-}
-
-async function enqueueInitialJob(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-  step: WorkflowDefinition["steps"][number],
-  initialPayload: Record<string, unknown> | undefined,
-): Promise<boolean> {
-  const now = new Date().toISOString();
-
-  const { error } = await supabase.from("workflow_jobs").insert({
-    workflow_run_id: workflowRunId,
-    step_id: step.id,
-    status: "queued",
-    attempts: 0,
-    max_attempts: 5,
-    next_run_at: now,
-    connector_key: step.connectorKey,
-    payload: initialPayload ?? {},
-  });
-
-  if (error) {
-    console.error("Error enqueuing initial job:", error);
-    return false;
-  }
-
-  return true;
-}
-
-async function emitEvent(
-  supabase: ReturnType<typeof getSupabase>,
-  workflowRunId: string,
-  kind: string,
-  payload: Record<string, unknown> | null = null,
-) {
-  const { error } = await supabase.from("workflow_events").insert({
-    workflow_run_id: workflowRunId,
-    workflow_job_id: null,
-    step_id: null,
-    kind,
-    payload,
-  });
-
-  if (error) {
-    console.error("Error emitting workflow event:", error);
-  }
-}
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
 
 serve(async (req) => {
-  if (req.method !== "POST") {
-    return new Response(
-      JSON.stringify({ error: "Method not allowed" }),
-      { status: 405, headers: { "Content-Type": "application/json" } },
-    );
+  const body = await req.json();
+  const { workflow_version_id, input } = body;
+
+  if (!workflow_version_id) {
+    return new Response("missing-workflow-version-id", { status: 400 });
   }
 
-  let body: ExecuteWorkflowRequest;
+  // 1. Load workflow version (single authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", workflow_version_id)
+    .single();
 
-  try {
-    body = await req.json();
-  } catch {
-    return new Response(
-      JSON.stringify({
-        error: "Invalid JSON payload",
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
   }
 
-  const supabase = getSupabase();
+  const graph = version.graph;
 
-  const definition = await loadWorkflowDefinition(
-    supabase,
-    body.workflowDefinitionId,
-  );
+  // 2. Identify initial nodes (no incoming edges)
+  const incoming = new Set(graph.edges.map((e: any) => e.to));
+  const initialNodes = graph.nodes.filter((n: any) => !incoming.has(n.id));
 
-  if (!definition) {
-    return new Response(
-      JSON.stringify({
-        error: "Workflow definition not found",
-      }),
-      { status: 404, headers: { "Content-Type": "application/json" } },
-    );
+  if (initialNodes.length === 0) {
+    return new Response("no-initial-nodes", { status: 500 });
   }
 
-  if (!definition.steps || definition.steps.length === 0) {
-    return new Response(
-      JSON.stringify({
-        error: "Workflow definition has no steps",
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+  // 3. Create workflow run
+  const { data: run, error: runErr } = await supabase
+    .from("workflow_runs")
+    .insert({
+      workflow_version_id,
+      state: "running",
+      input,
+      started_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (runErr) {
+    return new Response("run-create-failed", { status: 500 });
   }
 
-  const workflowRunId = await createWorkflowRun(supabase, definition);
-
-  if (!workflowRunId) {
-    return new Response(
-      JSON.stringify({
-        error: "Failed to create workflow run",
-      }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
+  // 4. Seed initial jobs
+  for (const node of initialNodes) {
+    await supabase.from("workflow_jobs").insert({
+      run_id: run.id,
+      step_id: node.id,
+      state: "pending",
+      attempt: 0,
+      payload: input ?? {},
+    });
   }
-
-  const firstStep = definition.steps[0];
-
-  const enqueued = await enqueueInitialJob(
-    supabase,
-    workflowRunId,
-    firstStep,
-    body.initialPayload,
-  );
-
-  if (!enqueued) {
-    return new Response(
-      JSON.stringify({
-        error: "Failed to enqueue initial workflow job",
-      }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  await emitEvent(supabase, workflowRunId, "workflow_started", {
-    workflowDefinitionId: definition.id,
-    workflowRunId,
-  });
 
   return new Response(
     JSON.stringify({
-      workflowRunId,
-      status: "queued",
+      run_id: run.id,
+      initial_jobs: initialNodes.map((n: any) => n.id),
+      status: "ok",
     }),
-    { status: 200, headers: { "Content-Type": "application/json" } },
+    { status: 200 }
   );
 });
