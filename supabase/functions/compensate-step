@@ -1,0 +1,108 @@
+// supabase/functions/compensate-step/index.ts
+// Valtaris Glue — Compensation Step Handler
+//
+// Compensation steps allow Glue to recover from failures.
+// When a job enters the dead-letter queue (DLQ), Glue can:
+//   - run a compensation step
+//   - undo or reverse a previous action
+//   - restore workflow state
+//   - continue execution after recovery
+//
+// Compensation is optional and controlled by:
+//   workflow_runs.compensation_enabled
+//
+// Authority chain:
+//   workflow_version → graph → compensation edges → job → worker
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { run_id, step_id, payload } = body;
+
+  if (!run_id || !step_id) {
+    return new Response("missing-run-or-step", { status: 400 });
+  }
+
+  // 1. Load workflow run
+  const { data: run } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (!run) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  if (!run.compensation_enabled) {
+    return new Response("compensation-disabled", { status: 403 });
+  }
+
+  // 2. Load workflow version (single authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", run.workflow_version_id)
+    .single();
+
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
+  }
+
+  const graph = version.graph;
+
+  // 3. Validate compensation step exists
+  const step = graph.nodes.find((n: any) => n.id === step_id);
+
+  if (!step) {
+    return new Response("step-not-found", { status: 404 });
+  }
+
+  if (step.type !== "compensate") {
+    return new Response("not-a-compensation-step", { status: 400 });
+  }
+
+  // 4. Enqueue compensation job
+  const { data: job, error: jobErr } = await supabase
+    .from("workflow_jobs")
+    .insert({
+      run_id,
+      step_id,
+      state: "pending",
+      attempt: 0,
+      payload: payload ?? {},
+      is_compensation: true,
+      created_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (jobErr) {
+    return new Response("compensation-job-create-failed", { status: 500 });
+  }
+
+  // 5. Mark run as "compensating"
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: "compensating",
+    })
+    .eq("id", run.id);
+
+  return new Response(
+    JSON.stringify({
+      run_id,
+      step_id,
+      job_id: job.id,
+      status: "compensation-enqueued",
+    }),
+    { status: 200 }
+  );
+});
