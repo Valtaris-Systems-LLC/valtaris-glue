@@ -1,0 +1,111 @@
+// supabase/functions/init-workflow/index.ts
+// Valtaris Glue — Unified Workflow Initializer
+//
+// This file initializes workflow runs deterministically.
+// It enforces:
+//   - version authority
+//   - graph authority
+//   - definition authority
+//   - step-run creation
+//   - initial job creation
+//   - run lifecycle initialization
+//
+// Authority chain:
+//   init-workflow → run-lifecycle → step-lifecycle → job-lifecycle → worker
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { workflow_version_id, input } = body;
+
+  if (!workflow_version_id) {
+    return new Response("missing-workflow-version-id", { status: 400 });
+  }
+
+  // 1. Load workflow version (single authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", workflow_version_id)
+    .single();
+
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
+  }
+
+  const graph = version.graph;
+  const definition = version.definition;
+
+  // 2. Create workflow run
+  const { data: run, error: runErr } = await supabase
+    .from("workflow_runs")
+    .insert({
+      workflow_version_id,
+      state: "created",
+      input,
+      created_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (runErr) {
+    return new Response("run-create-failed", { status: 500 });
+  }
+
+  // 3. Create step runs
+  const stepRuns = graph.nodes.map((node: any) => ({
+    run_id: run.id,
+    step_id: node.id,
+    state: "pending",
+    created_at: new Date().toISOString(),
+  }));
+
+  await supabase.from("workflow_step_runs").insert(stepRuns);
+
+  // 4. Create initial job for the start node
+  const startNode = graph.nodes.find((n: any) => n.type === "start");
+
+  if (!startNode) {
+    return new Response("missing-start-node", { status: 500 });
+  }
+
+  const { data: job, error: jobErr } = await supabase
+    .from("workflow_jobs")
+    .insert({
+      run_id: run.id,
+      step_id: startNode.id,
+      state: "pending",
+      attempt: 0,
+      payload: input ?? {},
+      created_at: new Date().toISOString(),
+    })
+    .select("*")
+    .single();
+
+  if (jobErr) {
+    return new Response("initial-job-create-failed", { status: 500 });
+  }
+
+  // 5. Mark run as "running"
+  await supabase.functions.invoke("run-lifecycle", {
+    body: { run_id: run.id, action: "start" },
+  });
+
+  return new Response(
+    JSON.stringify({
+      run_id: run.id,
+      workflow_version_id,
+      initial_step_id: startNode.id,
+      initial_job_id: job.id,
+      status: "initialized",
+    }),
+    { status: 200 }
+  );
+});
