@@ -2,12 +2,23 @@
 //
 // Every step execution flows through Connector.execute(input) -> ConnectorResult.
 // Adapters own timeout, auth detection, latency measurement, structured errors,
-// quota touch, and health-check hooks.
+// and health-check hooks.
 //
 // Compensation is deliberately separate from normal execution:
 // ConnectorCompensator.compensate(context) is used by rollback-executor.
-// A connector without a safe compensation contract returns null from
-// getCompensator() and rollback fails closed.
+//
+// IMPORTANT EXECUTION SAFETY:
+//
+//   unknown connector
+//          ↓
+//      FAIL CLOSED
+//
+//   known connector + missing credentials
+//          ↓
+//      MOCK ONLY WHEN EXPLICITLY ENABLED
+//
+// Glue must never silently turn an unavailable production connector into a
+// successful internal/mock operation.
 //
 // Workers never speak to connectors directly.
 
@@ -40,10 +51,8 @@ export interface ConnectorResult {
 export interface ConnectorAdapter {
   name: string;
 
-  /** Returns true if live credentials are present. */
   hasCredentials(): boolean;
 
-  /** Execute one forward action with a hard timeout. */
   execute(
     action: string,
     input: Record<string, unknown>,
@@ -53,7 +62,6 @@ export interface ConnectorAdapter {
     },
   ): Promise<ConnectorResult>;
 
-  /** Cheap probe used by connector_state ticker. */
   healthCheck?(): Promise<{
     ok: boolean;
     latency_ms: number;
@@ -85,69 +93,148 @@ export interface ConnectorCompensator {
   ): Promise<CompensationResult>;
 }
 
-// ─── utilities ────────────────────────────────────────────
+// ─── runtime configuration ───────────────────────────────
+
+/**
+ * Mock execution is deliberately opt-in.
+ *
+ * Supported values:
+ *   true
+ *   1
+ *   yes
+ *   on
+ *
+ * Anything else means live execution is required when credentials exist,
+ * and missing credentials fail closed.
+ */
+function mockModeEnabled(): boolean {
+  const value =
+    (
+      Deno.env.get(
+        "GLUE_ALLOW_MOCK_CONNECTORS",
+      ) ?? ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    value === "true" ||
+    value === "1" ||
+    value === "yes" ||
+    value === "on"
+  );
+}
+
+// ─── utilities ───────────────────────────────────────────
 
 function withTimeout<T>(
-  p: Promise<T>,
+  promise: Promise<T>,
   ms: number,
 ): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = setTimeout(() => {
-      reject(
-        new Error(`timeout after ${ms}ms`),
-      );
-    }, ms);
+  const timeoutMs =
+    Number.isFinite(ms) &&
+    ms > 0
+      ? ms
+      : 5000;
 
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      },
-    );
-  });
+  return new Promise<T>(
+    (resolve, reject) => {
+      const timer =
+        setTimeout(() => {
+          reject(
+            new Error(
+              `timeout after ${timeoutMs}ms`,
+            ),
+          );
+        }, timeoutMs);
+
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    },
+  );
+}
+
+function safeBody(
+  body: string,
+): string {
+  return body
+    .replace(
+      /[\r\n]+/g,
+      " ",
+    )
+    .slice(0, 500);
 }
 
 function classifyHttp(
   status: number,
   body: string,
 ): ConnectorError {
-  if (status === 401 || status === 403) {
+  const message =
+    safeBody(body) ||
+    `upstream returned HTTP ${status}`;
+
+  if (
+    status === 401 ||
+    status === 403
+  ) {
     return {
       kind: "auth",
       retryable: false,
       status,
-      message: body.slice(0, 200),
+      message,
     };
   }
 
-  if (status === 429) {
+  if (status === 408) {
+    return {
+      kind: "timeout",
+      retryable: true,
+      status,
+      message,
+    };
+  }
+
+  if (
+    status === 425 ||
+    status === 429
+  ) {
     return {
       kind: "rate_limit",
       retryable: true,
       status,
-      message: body.slice(0, 200),
+      message,
     };
   }
 
-  if (status >= 500) {
+  if (
+    status >= 500 &&
+    status <= 599
+  ) {
     return {
       kind: "upstream_5xx",
       retryable: true,
       status,
-      message: body.slice(0, 200),
+      message,
     };
   }
 
-  if (status >= 400) {
+  if (
+    status >= 400 &&
+    status <= 499
+  ) {
     return {
       kind: "upstream_4xx",
       retryable: false,
       status,
-      message: body.slice(0, 200),
+      message,
     };
   }
 
@@ -155,7 +242,49 @@ function classifyHttp(
     kind: "unknown",
     retryable: false,
     status,
-    message: body.slice(0, 200),
+    message,
+  };
+}
+
+function normalizeBody(
+  body: unknown,
+): Record<string, unknown> {
+  if (
+    body !== null &&
+    typeof body ===
+      "object" &&
+    !Array.isArray(body)
+  ) {
+    return body as Record<
+      string,
+      unknown
+    >;
+  }
+
+  return {
+    value: body,
+  };
+}
+
+function connectorFailure(
+  connector: string,
+  action: string,
+  kind: ErrorKind,
+  message: string,
+  retryable = false,
+  latency_ms = 0,
+): ConnectorResult {
+  return {
+    ok: false,
+    error: {
+      kind,
+      retryable,
+      message,
+    },
+    latency_ms,
+    mock: false,
+    connector,
+    action,
   };
 }
 
@@ -167,97 +296,141 @@ async function runAdapter(
   mockFn: () => Record<string, unknown>,
   timeoutMs: number,
 ): Promise<ConnectorResult> {
-  const t0 = Date.now();
+  const started =
+    Date.now();
 
+  /*
+   * ------------------------------------------------------------
+   * Explicit mock mode only.
+   * ------------------------------------------------------------
+   *
+   * Missing credentials are NOT sufficient to activate mock mode.
+   */
   if (!hasCreds) {
-    // Cheap simulated latency so mock mode is not instantaneous
-    // while remaining bounded.
-    await new Promise((r) =>
-      setTimeout(
-        r,
-        80 + Math.random() * 220,
-      )
-    );
+    if (
+      mockModeEnabled()
+    ) {
+      await new Promise(
+        (resolve) =>
+          setTimeout(
+            resolve,
+            80 +
+              Math.random() *
+                220,
+          ),
+      );
 
-    return {
-      ok: true,
-      data: mockFn(),
-      latency_ms: Date.now() - t0,
-      mock: true,
+      return {
+        ok: true,
+        data: mockFn(),
+        latency_ms:
+          Date.now() -
+          started,
+        mock: true,
+        connector,
+        action,
+      };
+    }
+
+    return connectorFailure(
       connector,
       action,
-    };
+      "auth",
+      `${connector} credentials are not configured`,
+      false,
+      Date.now() -
+        started,
+    );
   }
 
   try {
-    const resp = await withTimeout(
-      liveFn(),
-      timeoutMs,
-    );
+    const response =
+      await withTimeout(
+        liveFn(),
+        timeoutMs,
+      );
 
-    const text = await resp.text();
+    const text =
+      await response.text();
 
-    let body: unknown = text;
-
-    try {
-      body = JSON.parse(text);
-    } catch {
-      // Keep raw text when upstream does not return JSON.
-    }
-
-    if (!resp.ok) {
+    if (!response.ok) {
       return {
         ok: false,
-        error: classifyHttp(
-          resp.status,
-          text,
-        ),
+        error:
+          classifyHttp(
+            response.status,
+            text,
+          ),
         latency_ms:
-          Date.now() - t0,
+          Date.now() -
+          started,
         mock: false,
         connector,
         action,
       };
     }
 
+    let body: unknown =
+      text;
+
+    if (
+      text.trim()
+        .length > 0
+    ) {
+      try {
+        body =
+          JSON.parse(text);
+      } catch {
+        body = {
+          raw:
+            text.slice(
+              0,
+              2000,
+            ),
+        };
+      }
+    } else {
+      body = {};
+    }
+
     return {
       ok: true,
       data:
-        body as Record<
-          string,
-          unknown
-        >,
+        normalizeBody(
+          body,
+        ),
       latency_ms:
-        Date.now() - t0,
+        Date.now() -
+        started,
       mock: false,
       connector,
       action,
     };
-  } catch (e) {
-    const msg =
-      e instanceof Error
-        ? e.message
-        : String(e);
+  } catch (error) {
+    const message =
+      error instanceof
+        Error
+        ? error.message
+        : String(error);
 
-    const kind: ErrorKind =
-      msg.startsWith("timeout")
+    const timedOut =
+      message
+        .toLowerCase()
+        .startsWith(
+          "timeout",
+        );
+
+    return connectorFailure(
+      connector,
+      action,
+      timedOut
         ? "timeout"
-        : "unknown";
-
-    return {
-      ok: false,
-      error: {
-        kind,
-        retryable:
-          kind === "timeout",
-        message: msg,
-      },
-      latency_ms:
-        Date.now() - t0,
-      mock: false,
-      connector,
-      action,
-    };
+        : "unknown",
+      message,
+      timedOut,
+      Date.now() -
+        started,
+    );
   }
 }
 
@@ -267,7 +440,9 @@ const stripe: ConnectorAdapter = {
   name: "stripe",
 
   hasCredentials: () =>
-    !!Deno.env.get("STRIPE_KEY"),
+    !!Deno.env.get(
+      "STRIPE_KEY",
+    ),
 
   execute(
     action,
@@ -275,7 +450,9 @@ const stripe: ConnectorAdapter = {
     opts,
   ) {
     const key =
-      Deno.env.get("STRIPE_KEY");
+      Deno.env.get(
+        "STRIPE_KEY",
+      );
 
     return runAdapter(
       "stripe",
@@ -316,28 +493,27 @@ const stripe: ConnectorAdapter = {
         }
 
         const params =
-          new URLSearchParams(
-            Object.entries(
-              input,
-            ).reduce(
-              (
-                acc,
-                [k, v],
-              ) => {
-                acc[k] = String(v);
-                return acc;
-              },
-              {} as Record<
-                string,
-                string
-              >,
-            ),
+          new URLSearchParams();
+
+        for (
+          const [
+            key,
+            value,
+          ] of Object.entries(
+            input,
+          )
+        ) {
+          params.set(
+            key,
+            String(value),
           );
+        }
 
         return fetch(
           endpoint,
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Bearer ${key}`,
@@ -350,7 +526,8 @@ const stripe: ConnectorAdapter = {
                   }
                 : {}),
             },
-            body: params,
+            body:
+              params,
           },
         );
       },
@@ -373,24 +550,16 @@ const stripe: ConnectorAdapter = {
   },
 };
 
-// Stripe compensation.
-//
-// Supported compensation:
-//   charge -> refund
-//
-// The compensation contract requires the original Stripe charge/payment
-// identifier to be present in persisted source outputs or connector response.
-// If no identifier is available, compensation fails closed.
-//
-// Stripe's own idempotency key is propagated so repeated rollback attempts
-// cannot intentionally create duplicate refund operations.
+// ─── Stripe compensation ─────────────────────────────────
 
 const stripeCompensator: ConnectorCompensator = {
   async compensate(
     context,
   ): Promise<CompensationResult> {
     const key =
-      Deno.env.get("STRIPE_KEY");
+      Deno.env.get(
+        "STRIPE_KEY",
+      );
 
     if (!key) {
       return {
@@ -404,7 +573,7 @@ const stripeCompensator: ConnectorCompensator = {
       context.original_outputs ??
       {};
 
-    const response =
+    const connectorResponse =
       context.connector_response ??
       {};
 
@@ -418,7 +587,7 @@ const stripeCompensator: ConnectorCompensator = {
         ],
       ) ??
       firstString(
-        response,
+        connectorResponse,
         [
           "charge_id",
           "charge",
@@ -440,7 +609,7 @@ const stripeCompensator: ConnectorCompensator = {
         ["amount"],
       ) ??
       firstNumber(
-        response,
+        connectorResponse,
         ["amount"],
       );
 
@@ -450,7 +619,7 @@ const stripeCompensator: ConnectorCompensator = {
         ["currency"],
       ) ??
       firstString(
-        response,
+        connectorResponse,
         ["currency"],
       );
 
@@ -485,7 +654,8 @@ const stripeCompensator: ConnectorCompensator = {
           fetch(
             "https://api.stripe.com/v1/refunds",
             {
-              method: "POST",
+              method:
+                "POST",
               headers: {
                 Authorization:
                   `Bearer ${key}`,
@@ -494,7 +664,8 @@ const stripeCompensator: ConnectorCompensator = {
                 "Idempotency-Key":
                   context.idempotency_key,
               },
-              body: params,
+              body:
+                params,
             },
           ),
           10000,
@@ -502,16 +673,6 @@ const stripeCompensator: ConnectorCompensator = {
 
       const text =
         await response.text();
-
-      let body: unknown =
-        text;
-
-      try {
-        body =
-          JSON.parse(text);
-      } catch {
-        // Keep raw text below.
-      }
 
       if (!response.ok) {
         const error =
@@ -527,19 +688,35 @@ const stripeCompensator: ConnectorCompensator = {
         };
       }
 
+      let body: unknown =
+        text;
+
+      try {
+        body =
+          JSON.parse(text);
+      } catch {
+        body = {
+          raw:
+            text.slice(
+              0,
+              2000,
+            ),
+        };
+      }
+
       return {
         ok: true,
         data:
-          body as Record<
-            string,
-            unknown
-          >,
+          normalizeBody(
+            body,
+          ),
       };
     } catch (error) {
       return {
         ok: false,
         error:
-          error instanceof Error
+          error instanceof
+            Error
             ? error.message
             : String(error),
       };
@@ -553,7 +730,9 @@ const openai: ConnectorAdapter = {
   name: "openai",
 
   hasCredentials: () =>
-    !!Deno.env.get("OPENAI_KEY") ||
+    !!Deno.env.get(
+      "OPENAI_KEY",
+    ) ||
     !!Deno.env.get(
       "LOVABLE_API_KEY",
     ),
@@ -594,7 +773,8 @@ const openai: ConnectorAdapter = {
         return fetch(
           url,
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Bearer ${key}`,
@@ -610,7 +790,8 @@ const openai: ConnectorAdapter = {
                     : "gpt-4o-mini"),
                 messages: [
                   {
-                    role: "user",
+                    role:
+                      "user",
                     content:
                       String(
                         input.prompt ??
@@ -631,7 +812,8 @@ const openai: ConnectorAdapter = {
             input.correlation_id ??
             "op"
           } generated.`,
-        model: "mock",
+        model:
+          "mock",
         confidence:
           0.55 +
           Math.random() *
@@ -671,7 +853,8 @@ const sendgrid: ConnectorAdapter = {
         fetch(
           "https://api.sendgrid.com/v3/mail/send",
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Bearer ${key}`,
@@ -680,20 +863,21 @@ const sendgrid: ConnectorAdapter = {
             },
             body:
               JSON.stringify({
-                personalizations: [
-                  {
-                    to: [
-                      {
-                        email:
-                          input.to ??
-                          "noop@example.com",
-                      },
-                    ],
-                    subject:
-                      input.subject ??
-                      "Notification",
-                  },
-                ],
+                personalizations:
+                  [
+                    {
+                      to: [
+                        {
+                          email:
+                            input.to ??
+                            "noop@example.com",
+                        },
+                      ],
+                      subject:
+                        input.subject ??
+                        "Notification",
+                    },
+                  ],
                 from: {
                   email:
                     input.from ??
@@ -761,12 +945,14 @@ const twilio: ConnectorAdapter = {
     return runAdapter(
       "twilio",
       action,
-      !!sid && !!token,
+      !!sid &&
+        !!token,
       () =>
         fetch(
           `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`,
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Basic ${btoa(
@@ -797,7 +983,8 @@ const twilio: ConnectorAdapter = {
         sid:
           "SM_mock_" +
           Date.now(),
-        status: "queued",
+        status:
+          "queued",
         to:
           input.to ??
           "+10000000000",
@@ -836,7 +1023,8 @@ const slack: ConnectorAdapter = {
         fetch(
           "https://slack.com/api/chat.postMessage",
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Bearer ${key}`,
@@ -901,7 +1089,8 @@ const salesforce: ConnectorAdapter = {
     return runAdapter(
       "salesforce",
       action,
-      !!token && !!instance,
+      !!token &&
+        !!instance,
       () =>
         fetch(
           `${instance}/services/data/v60.0/sobjects/${
@@ -909,7 +1098,8 @@ const salesforce: ConnectorAdapter = {
             "Account"
           }`,
           {
-            method: "POST",
+            method:
+              "POST",
             headers: {
               Authorization:
                 `Bearer ${token}`,
@@ -949,13 +1139,13 @@ const internal: ConnectorAdapter = {
     action,
     input,
   ) {
-    const t0 =
+    const started =
       Date.now();
 
     await new Promise(
-      (r) =>
+      (resolve) =>
         setTimeout(
-          r,
+          resolve,
           40 +
             Math.random() *
               80,
@@ -970,7 +1160,8 @@ const internal: ConnectorAdapter = {
         echo: input,
       },
       latency_ms:
-        Date.now() - t0,
+        Date.now() -
+        started,
       mock: false,
       connector:
         "internal",
@@ -978,6 +1169,38 @@ const internal: ConnectorAdapter = {
     };
   },
 };
+
+// ─── unavailable connector ───────────────────────────────
+
+/**
+ * Unknown connectors fail closed.
+ *
+ * We deliberately do NOT return the internal adapter as a fallback.
+ * A typo or unregistered connector must never become a successful
+ * internal operation.
+ */
+function unavailableConnector(
+  name: string,
+): ConnectorAdapter {
+  return {
+    name,
+
+    hasCredentials:
+      () => false,
+
+    async execute(
+      action,
+    ) {
+      return connectorFailure(
+        name,
+        action,
+        "validation",
+        `connector "${name}" is not registered`,
+        false,
+      );
+    },
+  };
+}
 
 // ─── Connector registry ──────────────────────────────────
 
@@ -997,14 +1220,34 @@ const REGISTRY: Record<
 export function getConnector(
   name: string,
 ): ConnectorAdapter {
+  const normalized =
+    name
+      .trim()
+      .toLowerCase();
+
+  if (
+    normalized.length ===
+    0
+  ) {
+    return unavailableConnector(
+      "unknown",
+    );
+  }
+
   return (
-    REGISTRY[name] ??
-    internal
+    REGISTRY[
+      normalized
+    ] ??
+    unavailableConnector(
+      normalized,
+    )
   );
 }
 
 export const CONNECTOR_NAMES =
-  Object.keys(REGISTRY);
+  Object.keys(
+    REGISTRY,
+  );
 
 // ─── Compensation registry ───────────────────────────────
 //
@@ -1025,9 +1268,14 @@ const COMPENSATOR_REGISTRY: Record<
 export function getCompensator(
   name: string,
 ): ConnectorCompensator | null {
+  const normalized =
+    name
+      .trim()
+      .toLowerCase();
+
   return (
     COMPENSATOR_REGISTRY[
-      name
+      normalized
     ] ?? null
   );
 }
@@ -1046,7 +1294,9 @@ function firstString(
   >,
   keys: string[],
 ): string | null {
-  for (const key of keys) {
+  for (
+    const key of keys
+  ) {
     const value =
       source[key];
 
@@ -1069,14 +1319,18 @@ function firstNumber(
   >,
   keys: string[],
 ): number | null {
-  for (const key of keys) {
+  for (
+    const key of keys
+  ) {
     const value =
       source[key];
 
     if (
       typeof value ===
         "number" &&
-      Number.isFinite(value)
+      Number.isFinite(
+        value,
+      )
     ) {
       return value;
     }
@@ -1084,7 +1338,8 @@ function firstNumber(
     if (
       typeof value ===
         "string" &&
-      value.trim() !== ""
+      value.trim() !==
+        ""
     ) {
       const parsed =
         Number(value);
