@@ -1,0 +1,96 @@
+// supabase/functions/aggregate-connector-metrics/index.ts
+// Valtaris Glue — Connector Metrics Aggregator
+//
+// This file aggregates metrics at the connector level.
+// It produces analytics such as:
+//   - connector latency
+//   - connector throughput
+//   - connector error rate
+//   - connector DLQ frequency
+//   - connector retry frequency
+//   - connector compensation frequency
+//   - reliability score
+//
+// Authority chain:
+//   collect-metrics → aggregate-connector-metrics → dashboards
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async () => {
+  // 1. Load raw metrics
+  const { data: metrics } = await supabase
+    .from("workflow_metrics")
+    .select("*");
+
+  // 2. Group metrics by connector
+  const connectors = new Map();
+
+  for (const m of metrics) {
+    if (!m.connector) continue;
+
+    if (!connectors.has(m.connector)) {
+      connectors.set(m.connector, []);
+    }
+
+    connectors.get(m.connector).push(m);
+  }
+
+  const aggregates = [];
+
+  // 3. Aggregate connector metrics
+  for (const [connector, events] of connectors.entries()) {
+    const durations = events
+      .filter((e: any) => e.duration_ms)
+      .map((e: any) => e.duration_ms);
+
+    const avgLatency =
+      durations.length > 0
+        ? durations.reduce((a: number, b: number) => a + b, 0) /
+          durations.length
+        : 0;
+
+    const errorCount = events.filter((e: any) => e.error).length;
+    const dlqCount = events.filter((e: any) => e.event === "dlq").length;
+    const retryCount = events.filter((e: any) => e.event === "retry").length;
+    const compensationCount = events.filter(
+      (e: any) => e.event === "compensate"
+    ).length;
+
+    const throughput = events.length;
+
+    // Reliability score (simple heuristic)
+    const reliability =
+      throughput === 0
+        ? 1
+        : 1 - (errorCount + dlqCount + retryCount) / throughput;
+
+    aggregates.push({
+      connector,
+      avg_latency_ms: avgLatency,
+      throughput,
+      error_count: errorCount,
+      dlq_count: dlqCount,
+      retry_count: retryCount,
+      compensation_count: compensationCount,
+      reliability_score: reliability,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  // 4. Store aggregated metrics
+  await supabase.from("workflow_connector_metrics").insert(aggregates);
+
+  return new Response(
+    JSON.stringify({
+      status: "connector-metrics-aggregated",
+      connectors: aggregates.length,
+    }),
+    { status: 200 }
+  );
+});
