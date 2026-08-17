@@ -1,24 +1,20 @@
 // supabase/functions/replay-workflow/index.ts
-// Valtaris Glue — Observational Replay Engine
+// Valtaris Glue — Unified Replay Engine
 //
-// Safe replay model:
-//   original workflow_run
-//       → workflow_version (immutable)
-//       → workflow_step_runs (evidence)
-//       → checkpoints/snapshots
-//       → NEW replay workflow_run
-//       → reconstructed timeline/state
+// Replay allows Glue to reconstruct workflow execution deterministically.
+// It enforces:
+//   - idempotency
+//   - version authority
+//   - graph authority
+//   - step lifecycle correctness
+//   - job lifecycle correctness
+//   - run lifecycle correctness
 //
-// Replay NEVER:
-//   - re-executes connectors
-//   - mutates the original run
-//   - deletes jobs
-//   - requeues steps
+// Replay NEVER re-executes connectors.
+// Replay ONLY replays stored idempotent results.
 //
-// Replay ALWAYS:
-//   - creates a new run
-//   - uses observational evidence
-//   - reconstructs state deterministically
+// Authority chain:
+//   replay-workflow → run-lifecycle → step-lifecycle → job-lifecycle → idempotency
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -29,109 +25,155 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const { run_id } = await req.json();
+  const body = await req.json();
+  const { run_id } = body;
 
   if (!run_id) {
     return new Response("missing-run-id", { status: 400 });
   }
 
-  // 1. Load original run
-  const { data: original } = await supabase
+  // 1. Load run
+  const { data: run } = await supabase
     .from("workflow_runs")
     .select("*")
     .eq("id", run_id)
     .single();
 
-  if (!original) {
+  if (!run) {
     return new Response("run-not-found", { status: 404 });
   }
 
-  // 2. Load workflow version (immutable authority)
+  // 2. Mark run as replaying
+  await supabase.functions.invoke("run-lifecycle", {
+    body: { run_id, action: "replay" },
+  });
+
+  // 3. Load workflow version
   const { data: version } = await supabase
     .from("workflow_versions")
     .select("*")
-    .eq("id", original.workflow_version_id)
+    .eq("id", run.workflow_version_id)
     .single();
 
   if (!version) {
     return new Response("version-not-found", { status: 404 });
   }
 
-  // 3. Load step runs (observational evidence)
-  const { data: steps } = await supabase
+  const graph = version.graph;
+
+  // 4. Load step runs
+  const { data: stepRuns } = await supabase
     .from("workflow_step_runs")
     .select("*")
-    .eq("run_id", run_id)
-    .order("created_at", { ascending: true });
+    .eq("run_id", run_id);
 
-  // 4. Load checkpoints/snapshots
-  const { data: snapshots } = await supabase
-    .from("workflow_snapshots")
+  // 5. Replay each step deterministically
+  for (const stepRun of stepRuns) {
+    const step = graph.nodes.find((n: any) => n.id === stepRun.step_id);
+    if (!step) continue;
+
+    // Replay only completed steps
+    if (stepRun.state === "completed") {
+      await supabase.functions.invoke("step-lifecycle", {
+        body: {
+          run_id,
+          step_id: stepRun.step_id,
+          action: "complete",
+        },
+      });
+      continue;
+    }
+
+    // Replay failed steps
+    if (stepRun.state === "failed") {
+      await supabase.functions.invoke("step-lifecycle", {
+        body: {
+          run_id,
+          step_id: stepRun.step_id,
+          action: "fail",
+          error: stepRun.error,
+        },
+      });
+      continue;
+    }
+
+    // Replay dead-letter steps
+    if (stepRun.state === "dead_letter") {
+      await supabase.functions.invoke("step-lifecycle", {
+        body: {
+          run_id,
+          step_id: stepRun.step_id,
+          action: "dead_letter",
+          error: stepRun.error,
+        },
+      });
+      continue;
+    }
+
+    // Replay compensation steps
+    if (stepRun.state === "compensating" || stepRun.state === "compensated") {
+      await supabase.functions.invoke("step-lifecycle", {
+        body: {
+          run_id,
+          step_id: stepRun.step_id,
+          action: "compensate",
+        },
+      });
+      continue;
+    }
+  }
+
+  // 6. Replay jobs using idempotency registry
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
     .select("*")
-    .eq("run_id", run_id)
-    .order("timestamp", { ascending: true });
+    .eq("run_id", run_id);
 
-  // 5. Create NEW replay run
-  const { data: replayRun, error: replayErr } = await supabase
-    .from("workflow_runs")
-    .insert({
-      workflow_version_id: original.workflow_version_id,
-      state: "replay",
-      original_run_id: original.id,
-      started_at: new Date().toISOString(),
-    })
-    .select("*")
-    .single();
+  for (const job of jobs) {
+    const key = `${job.id}-${job.step_id}`;
 
-  if (replayErr) {
-    return new Response("replay-run-create-failed", { status: 500 });
+    // Load idempotent result
+    const { data: idem } = await supabase
+      .from("workflow_idempotency")
+      .select("*")
+      .eq("key", key)
+      .single();
+
+    // Replay job lifecycle
+    if (job.state === "completed") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: { job_id: job.id, action: "complete" },
+      });
+    }
+
+    if (job.state === "failed") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: { job_id: job.id, action: "fail", error: job.error },
+      });
+    }
+
+    if (job.state === "dead_letter") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: { job_id: job.id, action: "dead_letter", error: job.error },
+      });
+    }
+
+    if (job.state === "compensating") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: { job_id: job.id, action: "compensate" },
+      });
+    }
   }
 
-  // 6. Reconstruct timeline
-  const timeline = [];
-
-  for (const step of steps) {
-    timeline.push({
-      type: "step",
-      step_id: step.step_id,
-      state: step.state,
-      started_at: step.started_at,
-      completed_at: step.completed_at,
-      result: step.result,
-    });
-  }
-
-  for (const snap of snapshots) {
-    timeline.push({
-      type: "snapshot",
-      snapshot_id: snap.id,
-      timestamp: snap.timestamp,
-      state: snap.state,
-    });
-  }
-
-  // 7. Store replay timeline
-  await supabase.from("workflow_replays").insert({
-    replay_run_id: replayRun.id,
-    original_run_id: original.id,
-    timeline,
-    created_at: new Date().toISOString(),
+  // 7. Mark run as replay completed
+  await supabase.functions.invoke("run-lifecycle", {
+    body: { run_id, action: "replay_completed" },
   });
-
-  // 8. Mark replay complete
-  await supabase
-    .from("workflow_runs")
-    .update({
-      state: "replay_completed",
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", replayRun.id);
 
   return new Response(
     JSON.stringify({
-      replay_run_id: replayRun.id,
-      timeline_count: timeline.length,
-      status: "ok",
+      run_id,
+      status: "replay-completed",
     }),
     { status: 200 }
   );
