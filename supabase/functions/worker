@@ -1,0 +1,462 @@
+// supabase/functions/worker/index.ts
+// Valtaris Glue — Workflow Worker Runtime
+//
+// This Edge Function is responsible for:
+// - Claiming queued workflow jobs
+// - Executing workflow steps
+// - Invoking connectors
+// - Handling retries and backoff
+// - Routing to DLQ when exhausted
+// - Emitting incidents and events
+// - Advancing workflow progression
+// - Persisting checkpoints
+
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.47.0";
+import type { PostgrestSingleResponse } from "https://esm.sh/@supabase/supabase-js@2.47.0";
+
+type WorkflowJobStatus = "queued" | "claimed" | "running" | "completed" | "failed" | "dead_letter";
+type WorkflowRunStatus = "pending" | "running" | "completed" | "failed";
+
+interface WorkflowJob {
+  id: string;
+  workflow_run_id: string;
+  step_id: string;
+  status: WorkflowJobStatus;
+  attempts: number;
+  max_attempts: number;
+  next_run_at: string | null;
+  connector_key: string | null;
+  payload: Record<string, unknown> | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface WorkflowRun {
+  id: string;
+  workflow_definition_id: string;
+  status: WorkflowRunStatus;
+  current_step_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface WorkflowIncident {
+  id?: string;
+  workflow_run_id: string;
+  workflow_job_id: string | null;
+  step_id: string | null;
+  severity: "info" | "warning" | "error";
+  code: string;
+  message: string;
+  context: Record<string, unknown> | null;
+}
+
+interface ConnectorResult {
+  success: boolean;
+  output?: Record<string, unknown>;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+const WORKER_ID = crypto.randomUUID();
+const MAX_CLAIM_BATCH = 10;
+const DEFAULT_MAX_ATTEMPTS = 5;
+const BASE_BACKOFF_MS = 5_000;
+
+function getSupabaseClient(serviceRoleKey?: string) {
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = serviceRoleKey ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  if (!url || !key) {
+    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  }
+
+  return createClient(url, key, {
+    auth: { persistSession: false },
+  });
+}
+
+function calculateNextRun(attempts: number): string {
+  const backoff = BASE_BACKOFF_MS * Math.pow(2, attempts - 1);
+  const next = new Date(Date.now() + backoff);
+  return next.toISOString();
+}
+
+async function claimJobs(supabase: ReturnType<typeof getSupabaseClient>): Promise<WorkflowJob[]> {
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("workflow_jobs")
+    .update({
+      status: "claimed",
+      updated_at: now,
+      worker_id: WORKER_ID,
+    })
+    .eq("status", "queued")
+    .lte("next_run_at", now)
+    .limit(MAX_CLAIM_BATCH)
+    .select("*");
+
+  if (error) {
+    console.error("Error claiming jobs:", error);
+    return [];
+  }
+
+  return data ?? [];
+}
+
+async function loadWorkflowRun(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  workflowRunId: string,
+): Promise<WorkflowRun | null> {
+  const { data, error }: PostgrestSingleResponse<WorkflowRun> = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", workflowRunId)
+    .single();
+
+  if (error) {
+    console.error("Error loading workflow run:", error);
+    return null;
+  }
+
+  return data ?? null;
+}
+
+async function recordIncident(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  incident: WorkflowIncident,
+): Promise<void> {
+  const { error } = await supabase.from("workflow_incidents").insert({
+    workflow_run_id: incident.workflow_run_id,
+    workflow_job_id: incident.workflow_job_id,
+    step_id: incident.step_id,
+    severity: incident.severity,
+    code: incident.code,
+    message: incident.message,
+    context: incident.context ?? null,
+  });
+
+  if (error) {
+    console.error("Error recording incident:", error);
+  }
+}
+
+async function emitEvent(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  workflowRunId: string,
+  workflowJobId: string | null,
+  stepId: string | null,
+  kind: string,
+  payload: Record<string, unknown> | null = null,
+): Promise<void> {
+  const { error } = await supabase.from("workflow_events").insert({
+    workflow_run_id: workflowRunId,
+    workflow_job_id: workflowJobId,
+    step_id: stepId,
+    kind,
+    payload,
+  });
+
+  if (error) {
+    console.error("Error emitting event:", error);
+  }
+}
+
+async function updateWorkflowRunStatus(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  workflowRunId: string,
+  status: WorkflowRunStatus,
+): Promise<void> {
+  const { error } = await supabase
+    .from("workflow_runs")
+    .update({
+      status,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", workflowRunId);
+
+  if (error) {
+    console.error("Error updating workflow run status:", error);
+  }
+}
+
+async function markJobCompleted(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  job: WorkflowJob,
+  output: Record<string, unknown> | null,
+): Promise<void> {
+  const now = new Date().toISOString();
+
+  const { error } = await supabase
+    .from("workflow_jobs")
+    .update({
+      status: "completed",
+      updated_at: now,
+      output,
+    })
+    .eq("id", job.id);
+
+  if (error) {
+    console.error("Error marking job completed:", error);
+  }
+
+  await emitEvent(
+    supabase,
+    job.workflow_run_id,
+    job.id,
+    job.step_id,
+    "job_completed",
+    { output },
+  );
+}
+
+async function markJobFailed(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  job: WorkflowJob,
+  errorCode: string,
+  errorMessage: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+
+  const attempts = job.attempts + 1;
+  const maxAttempts = job.max_attempts || DEFAULT_MAX_ATTEMPTS;
+
+  if (attempts >= maxAttempts) {
+    const { error } = await supabase
+      .from("workflow_jobs")
+      .update({
+        status: "dead_letter",
+        attempts,
+        error_code: errorCode,
+        error_message: errorMessage,
+        updated_at: now,
+      })
+      .eq("id", job.id);
+
+    if (error) {
+      console.error("Error marking job dead_letter:", error);
+    }
+
+    await emitEvent(
+      supabase,
+      job.workflow_run_id,
+      job.id,
+      job.step_id,
+      "job_dead_letter",
+      { errorCode, errorMessage, attempts, maxAttempts },
+    );
+
+    await recordIncident(supabase, {
+      workflow_run_id: job.workflow_run_id,
+      workflow_job_id: job.id,
+      step_id: job.step_id,
+      severity: "error",
+      code: "workflow.job.dead_letter",
+      message: `Job moved to dead-letter after ${attempts} attempts`,
+      context: {
+        errorCode,
+        errorMessage,
+        attempts,
+        maxAttempts,
+      },
+    });
+
+    await updateWorkflowRunStatus(supabase, job.workflow_run_id, "failed");
+    return;
+  }
+
+  const nextRunAt = calculateNextRun(attempts);
+
+  const { error } = await supabase
+    .from("workflow_jobs")
+    .update({
+      status: "queued",
+      attempts,
+      error_code: errorCode,
+      error_message: errorMessage,
+      next_run_at: nextRunAt,
+      updated_at: now,
+    })
+    .eq("id", job.id);
+
+  if (error) {
+    console.error("Error marking job failed:", error);
+  }
+
+  await emitEvent(
+    supabase,
+    job.workflow_run_id,
+    job.id,
+    job.step_id,
+    "job_retry_scheduled",
+    { errorCode, errorMessage, attempts, nextRunAt },
+  );
+
+  await recordIncident(supabase, {
+    workflow_run_id: job.workflow_run_id,
+    workflow_job_id: job.id,
+    step_id: job.step_id,
+    severity: "warning",
+    code: "workflow.job.retry_scheduled",
+    message: `Job scheduled for retry (attempt ${attempts})`,
+    context: {
+      errorCode,
+      errorMessage,
+      attempts,
+      nextRunAt,
+    },
+  });
+}
+
+async function invokeConnector(
+  connectorKey: string | null,
+  payload: Record<string, unknown> | null,
+): Promise<ConnectorResult> {
+  if (!connectorKey) {
+    return {
+      success: false,
+      errorCode: "connector.missing",
+      errorMessage: "No connector_key provided for workflow job",
+    };
+  }
+
+  try {
+    // Placeholder: in a real implementation, this would dispatch to
+    // a connector registry or adapter layer.
+    //
+    // For now, we simulate a successful connector call.
+    return {
+      success: true,
+      output: {
+        connectorKey,
+        echo: payload ?? {},
+        executedAt: new Date().toISOString(),
+      },
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      errorCode: "connector.execution_failed",
+      errorMessage: message,
+    };
+  }
+}
+
+async function processJob(
+  supabase: ReturnType<typeof getSupabaseClient>,
+  job: WorkflowJob,
+): Promise<void> {
+  await emitEvent(
+    supabase,
+    job.workflow_run_id,
+    job.id,
+    job.step_id,
+    "job_started",
+    { workerId: WORKER_ID },
+  );
+
+  const run = await loadWorkflowRun(supabase, job.workflow_run_id);
+  if (!run) {
+    await markJobFailed(
+      supabase,
+      job,
+      "workflow.run.not_found",
+      "Workflow run not found",
+    );
+    return;
+  }
+
+  if (run.status === "completed" || run.status === "failed") {
+    await emitEvent(
+      supabase,
+      job.workflow_run_id,
+      job.id,
+      job.step_id,
+      "job_skipped",
+      { reason: "run_already_terminal", runStatus: run.status },
+    );
+    return;
+  }
+
+  const connectorResult = await invokeConnector(job.connector_key, job.payload ?? {});
+
+  if (!connectorResult.success) {
+    await markJobFailed(
+      supabase,
+      job,
+      connectorResult.errorCode ?? "connector.error",
+      connectorResult.errorMessage ?? "Connector execution failed",
+    );
+    return;
+  }
+
+  await markJobCompleted(supabase, job, connectorResult.output ?? null);
+
+  // For now, we simply mark the run as completed when a job completes.
+  // In a full DAG engine, this would advance to the next step or branch.
+  await updateWorkflowRunStatus(supabase, job.workflow_run_id, "completed");
+}
+
+serve(async (req) => {
+  if (req.method !== "POST") {
+    return new Response(
+      JSON.stringify({ error: "Method not allowed" }),
+      { status: 405, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  let supabase;
+  try {
+    supabase = getSupabaseClient();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Worker initialization error:", message);
+    return new Response(
+      JSON.stringify({ error: "Worker initialization failed", details: message }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  try {
+    const jobs = await claimJobs(supabase);
+
+    if (jobs.length === 0) {
+      return new Response(
+        JSON.stringify({ claimed: 0, workerId: WORKER_ID }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    for (const job of jobs) {
+      try {
+        await processJob(supabase, job);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error("Error processing job:", job.id, message);
+        await markJobFailed(
+          supabase,
+          job,
+          "worker.unhandled_error",
+          message,
+        );
+      }
+    }
+
+    return new Response(
+      JSON.stringify({ claimed: jobs.length, workerId: WORKER_ID }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Worker runtime error:", message);
+    return new Response(
+      JSON.stringify({ error: "Worker runtime failed", details: message }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+});
