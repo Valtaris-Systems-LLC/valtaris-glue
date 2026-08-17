@@ -1,0 +1,64 @@
+// supabase/functions/load-definition/index.ts
+// Valtaris Glue — Unified Workflow Definition Loader
+//
+// This replaces ALL legacy workflow definition paths.
+// It enforces strict version authority:
+//
+//   workflow_version_id → workflow_versions.definition
+//
+// No fallback to workflow_definitions.
+// No inline JSON definitions.
+// No ad-hoc reconstruction.
+//
+// This function is used by:
+//   - execute-workflow
+//   - run-worker
+//   - replay-workflow
+//
+// It guarantees that every workflow execution path
+// uses the SAME immutable definition.
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { workflow_version_id } = body;
+
+  if (!workflow_version_id) {
+    return new Response("missing-workflow-version-id", { status: 400 });
+  }
+
+  // 1. Load workflow version (single authority)
+  const { data: version } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", workflow_version_id)
+    .single();
+
+  if (!version) {
+    return new Response("version-not-found", { status: 404 });
+  }
+
+  // 2. Validate definition structure
+  const definition = version.definition;
+
+  if (!definition || typeof definition !== "object") {
+    return new Response("invalid-definition", { status: 500 });
+  }
+
+  // 3. Return immutable definition
+  return new Response(
+    JSON.stringify({
+      workflow_version_id,
+      definition,
+      status: "ok",
+    }),
+    { status: 200 }
+  );
+});
