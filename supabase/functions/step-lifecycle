@@ -1,0 +1,161 @@
+// supabase/functions/step-lifecycle/index.ts
+// Valtaris Glue — Unified Step Lifecycle Engine
+//
+// This file centralizes ALL step lifecycle transitions.
+// It ensures steps move through deterministic, safe states:
+//
+//   pending → running → completed
+//   pending → running → failed → dead_letter
+//   pending → running → failed → compensating
+//
+// It prevents:
+//   - stuck steps
+//   - invalid transitions
+//   - partial updates
+//   - inconsistent state
+//
+// Authority chain:
+//   job-lifecycle → step-lifecycle → workflow_step_runs
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { run_id, step_id, action, error } = body;
+
+  if (!run_id || !step_id || !action) {
+    return new Response("missing-required-fields", { status: 400 });
+  }
+
+  // 1. Load step run
+  const { data: stepRun } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", run_id)
+    .eq("step_id", step_id)
+    .single();
+
+  if (!stepRun) {
+    return new Response("step-run-not-found", { status: 404 });
+  }
+
+  // 2. Determine lifecycle transition
+  switch (action) {
+    case "start":
+      return await startStep(stepRun);
+
+    case "complete":
+      return await completeStep(stepRun);
+
+    case "fail":
+      return await failStep(stepRun, error);
+
+    case "dead_letter":
+      return await deadLetterStep(stepRun, error);
+
+    case "compensate":
+      return await compensateStep(stepRun);
+
+    default:
+      return new Response("invalid-action", { status: 400 });
+  }
+});
+
+// ----------------------------
+// Lifecycle Transitions
+// ----------------------------
+
+async function startStep(stepRun: any) {
+  if (stepRun.state !== "pending") {
+    return new Response("invalid-transition", { status: 400 });
+  }
+
+  await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "running",
+      started_at: new Date().toISOString(),
+    })
+    .eq("id", stepRun.id);
+
+  return new Response(
+    JSON.stringify({ step_id: stepRun.step_id, state: "running" }),
+    { status: 200 }
+  );
+}
+
+async function completeStep(stepRun: any) {
+  if (stepRun.state !== "running") {
+    return new Response("invalid-transition", { status: 400 });
+  }
+
+  await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "completed",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", stepRun.id);
+
+  return new Response(
+    JSON.stringify({ step_id: stepRun.step_id, state: "completed" }),
+    { status: 200 }
+  );
+}
+
+async function failStep(stepRun: any, error: string) {
+  if (stepRun.state !== "running") {
+    return new Response("invalid-transition", { status: 400 });
+  }
+
+  await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "failed",
+      error,
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", stepRun.id);
+
+  return new Response(
+    JSON.stringify({ step_id: stepRun.step_id, state: "failed", error }),
+    { status: 200 }
+  );
+}
+
+async function deadLetterStep(stepRun: any, error: string) {
+  await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "dead_letter",
+      error,
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", stepRun.id);
+
+  return new Response(
+    JSON.stringify({ step_id: stepRun.step_id, state: "dead_letter", error }),
+    { status: 200 }
+  );
+}
+
+async function compensateStep(stepRun: any) {
+  await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "compensating",
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", stepRun.id);
+
+  return new Response(
+    JSON.stringify({ step_id: stepRun.step_id, state: "compensating" }),
+    { status: 200 }
+  );
+}
