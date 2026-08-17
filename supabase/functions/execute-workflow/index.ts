@@ -1,19 +1,37 @@
-// execute-workflow — authenticated, version-pinned enqueue endpoint.
+// execute-workflow — authenticated, version-pinned durable launch.
 //
-// Creates a workflow_run pinned to an immutable published workflow version,
-// enqueues the root DAG nodes from that version's graph, then triggers the
-// durable worker.
+// This function owns the launch boundary only:
 //
-// Execution itself remains in run-worker. This function is responsible only
-// for authenticated launch + durable run/job creation.
+//   authenticate
+//      ↓
+//   resolve immutable published workflow version
+//      ↓
+//   authorize against version tenant
+//      ↓
+//   validate immutable graph
+//      ↓
+//   create run + root jobs
+//      ↓
+//   mark run running
+//      ↓
+//   kick durable worker
+//
+// Execution itself remains in run-worker.
+//
+// IMPORTANT:
+// - workflow_version_id is the authoritative execution definition.
+// - mutable workflow_dags / dag_id are not used for execution.
+// - the worker is safe to kick repeatedly because job claiming is
+//   responsible for concurrency control.
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { requireUser, serviceClient } from "../_shared/auth.ts";
+import { requireUser, serviceClient, logSecurity } from "../_shared/auth.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods":
+    "POST, OPTIONS",
 };
 
 interface DagNode {
@@ -30,94 +48,315 @@ interface WorkflowGraph {
   edges?: Array<Record<string, unknown>>;
 }
 
-function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...cors, "Content-Type": "application/json" },
-  });
+interface WorkflowVersion {
+  id: string;
+  definition_id: string;
+  tenant_id: string;
+  version: number | string;
+  state: string;
+  graph: WorkflowGraph | null;
+  metadata?: Record<string, unknown> | null;
+}
+
+function json(
+  body: unknown,
+  status = 200,
+) {
+  return new Response(
+    JSON.stringify(body),
+    {
+      status,
+      headers: {
+        ...cors,
+        "Content-Type":
+          "application/json",
+      },
+    },
+  );
+}
+
+function isNonEmptyString(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0
+  );
+}
+
+function normalizePayload(
+  value: unknown,
+): Record<string, unknown> {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    return value as Record<
+      string,
+      unknown
+    >;
+  }
+
+  return {};
+}
+
+function validateGraph(
+  graph: WorkflowGraph,
+) {
+  const nodes = Array.isArray(graph.nodes)
+    ? graph.nodes
+    : [];
+
+  if (nodes.length === 0) {
+    return {
+      ok: false as const,
+      error:
+        "workflow version graph contains no executable nodes",
+    };
+  }
+
+  const nodeIds = new Set<string>();
+
+  for (const node of nodes) {
+    if (
+      !isNonEmptyString(node.id)
+    ) {
+      return {
+        ok: false as const,
+        error:
+          "workflow graph contains a node without a valid id",
+      };
+    }
+
+    const nodeId =
+      node.id.trim();
+
+    if (nodeIds.has(nodeId)) {
+      return {
+        ok: false as const,
+        error:
+          `workflow graph contains duplicate node id: ${nodeId}`,
+      };
+    }
+
+    nodeIds.add(nodeId);
+  }
+
+  for (const node of nodes) {
+    const dependencies =
+      Array.isArray(
+        node.dependsOn,
+      )
+        ? node.dependsOn
+        : [];
+
+    for (const dependency of dependencies) {
+      if (
+        !isNonEmptyString(
+          dependency,
+        )
+      ) {
+        return {
+          ok: false as const,
+          error:
+            `node ${node.id} contains an invalid dependency reference`,
+        };
+      }
+
+      if (
+        !nodeIds.has(
+          dependency.trim(),
+        )
+      ) {
+        return {
+          ok: false as const,
+          error:
+            `node ${node.id} references missing dependency ${dependency}`,
+        };
+      }
+    }
+  }
+
+  const roots = nodes.filter(
+    (node) =>
+      Array.isArray(
+        node.dependsOn,
+      )
+        ? node.dependsOn.length === 0
+        : true,
+  );
+
+  if (roots.length === 0) {
+    return {
+      ok: false as const,
+      error:
+        "workflow version graph has no root nodes",
+    };
+  }
+
+  return {
+    ok: true as const,
+    nodes,
+    roots,
+  };
 }
 
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: cors });
+  if (
+    req.method === "OPTIONS"
+  ) {
+    return new Response(
+      "ok",
+      { headers: cors },
+    );
   }
 
-  if (req.method !== "POST") {
-    return json({ error: "method not allowed" }, 405);
+  if (
+    req.method !== "POST"
+  ) {
+    return json(
+      {
+        error:
+          "method not allowed",
+      },
+      405,
+    );
   }
 
-  const auth = await requireUser(req);
+  const auth =
+    await requireUser(req);
 
   if (!auth.ok) {
-    return json({ error: auth.error }, auth.status);
+    return json(
+      {
+        error: auth.error,
+      },
+      auth.status,
+    );
   }
 
-  const operatorUid = auth.ctx.userId;
-  const sb = serviceClient();
+  const operatorUid =
+    auth.ctx.userId;
+
+  const sb =
+    serviceClient();
+
+  let runId:
+    | string
+    | null = null;
+
+  let runTenantId:
+    | string
+    | null = null;
 
   try {
-    const body = await req.json().catch(() => ({}));
+    const body =
+      await req
+        .json()
+        .catch(
+          () => ({}),
+        );
 
-    const workflowVersionId =
-      body.workflow_version_id ??
-      body.version_id ??
-      null;
+    /*
+     * ------------------------------------------------------------
+     * 1. Read launch request.
+     * ------------------------------------------------------------
+     */
 
-    const definitionId =
-      body.definition_id ??
-      null;
+    const suppliedVersionId =
+      isNonEmptyString(
+        body.workflow_version_id,
+      )
+        ? body.workflow_version_id.trim()
+        : isNonEmptyString(
+              body.version_id,
+            )
+          ? body.version_id.trim()
+          : null;
+
+    const suppliedDefinitionId =
+      isNonEmptyString(
+        body.definition_id,
+      )
+        ? body.definition_id.trim()
+        : null;
 
     const workflowName =
-      typeof body.workflow_name === "string" && body.workflow_name.trim()
+      isNonEmptyString(
+        body.workflow_name,
+      )
         ? body.workflow_name.trim()
         : null;
 
     const correlationId =
-      typeof body.correlation_id === "string" && body.correlation_id.trim()
+      isNonEmptyString(
+        body.correlation_id,
+      )
         ? body.correlation_id.trim()
         : crypto.randomUUID();
 
     const payload =
-      body.payload !== null &&
-      typeof body.payload === "object" &&
-      !Array.isArray(body.payload)
-        ? body.payload
-        : {};
+      normalizePayload(
+        body.payload,
+      );
 
     /*
-     * A run must resolve to an immutable published workflow version.
+     * ------------------------------------------------------------
+     * 2. Resolve exactly one immutable workflow version.
      *
-     * If the caller supplies definition_id instead of version_id, resolve
-     * the definition's current published version atomically from the
-     * workflow_published_versions control record.
+     * If the caller supplies a definition instead of a version,
+     * resolve the currently published version from the publication
+     * control record.
+     * ------------------------------------------------------------
      */
-    let resolvedVersionId: string | null =
-      typeof workflowVersionId === "string" && workflowVersionId.trim()
-        ? workflowVersionId.trim()
-        : null;
 
-    if (!resolvedVersionId && typeof definitionId === "string" && definitionId.trim()) {
-      const { data: published, error: publishedErr } = await sb
-        .from("workflow_published_versions")
-        .select("version_id, tenant_id")
-        .eq("definition_id", definitionId.trim())
+    let resolvedVersionId =
+      suppliedVersionId;
+
+    if (
+      !resolvedVersionId &&
+      suppliedDefinitionId
+    ) {
+      const {
+        data: published,
+        error: publishedErr,
+      } = await sb
+        .from(
+          "workflow_published_versions",
+        )
+        .select(
+          "version_id, tenant_id, definition_id",
+        )
+        .eq(
+          "definition_id",
+          suppliedDefinitionId,
+        )
         .maybeSingle();
 
       if (publishedErr) {
         throw publishedErr;
       }
 
-      if (!published?.version_id) {
+      if (
+        !published?.version_id
+      ) {
         return json(
-          { error: "definition has no published workflow version" },
+          {
+            error:
+              "definition has no published workflow version",
+          },
           409,
         );
       }
 
-      resolvedVersionId = published.version_id;
+      resolvedVersionId =
+        published.version_id;
     }
 
-    if (!resolvedVersionId) {
+    if (
+      !resolvedVersionId
+    ) {
       return json(
         {
           error:
@@ -128,50 +367,118 @@ Deno.serve(async (req) => {
     }
 
     /*
-     * Resolve the immutable version itself.
-     *
-     * The graph comes from workflow_versions rather than workflow_dags.
-     * Published/archived/deprecated versions are immutable by database
-     * trigger, so the graph used here cannot silently change underneath
-     * this launch request.
+     * ------------------------------------------------------------
+     * 3. Load the immutable version.
+     * ------------------------------------------------------------
      */
-    const { data: version, error: versionErr } = await sb
-      .from("workflow_versions")
-      .select(
-        "id, definition_id, tenant_id, version, state, graph, metadata",
+
+    const {
+      data: versionRow,
+      error: versionErr,
+    } = await sb
+      .from(
+        "workflow_versions",
       )
-      .eq("id", resolvedVersionId)
+      .select(
+        [
+          "id",
+          "definition_id",
+          "tenant_id",
+          "version",
+          "state",
+          "graph",
+          "metadata",
+        ].join(","),
+      )
+      .eq(
+        "id",
+        resolvedVersionId,
+      )
       .maybeSingle();
 
     if (versionErr) {
       throw versionErr;
     }
 
-    if (!version) {
-      return json({ error: "workflow version not found" }, 404);
-    }
-
-    if (version.state !== "published") {
+    if (!versionRow) {
       return json(
         {
-          error: "workflow version is not runnable",
-          version_id: version.id,
-          state: version.state,
+          error:
+            "workflow version not found",
+          version_id:
+            resolvedVersionId,
+        },
+        404,
+      );
+    }
+
+    const version =
+      versionRow as WorkflowVersion;
+
+    /*
+     * The supplied definition_id is only a selector. Once the
+     * version is resolved, the version's definition_id is authoritative.
+     *
+     * Reject mismatches rather than silently executing a caller's
+     * inconsistent request.
+     */
+    if (
+      suppliedDefinitionId &&
+      version.definition_id !==
+        suppliedDefinitionId
+    ) {
+      return json(
+        {
+          error:
+            "definition_id does not match workflow version",
+          workflow_version_id:
+            version.id,
+          requested_definition_id:
+            suppliedDefinitionId,
+          version_definition_id:
+            version.definition_id,
+        },
+        409,
+      );
+    }
+
+    if (
+      version.state !==
+      "published"
+    ) {
+      return json(
+        {
+          error:
+            "workflow version is not runnable",
+          version_id:
+            version.id,
+          state:
+            version.state,
         },
         409,
       );
     }
 
     /*
-     * Authorization is bound to the version's tenant, never to a tenant_id
-     * supplied by the caller.
+     * ------------------------------------------------------------
+     * 4. Authorize against the version's tenant.
+     *
+     * Never trust a tenant_id supplied by the caller.
+     * ------------------------------------------------------------
      */
-    const { data: allowed, error: accessErr } = await sb.rpc(
+
+    const {
+      data: allowed,
+      error: accessErr,
+    } = await sb.rpc(
       "has_operator_role",
       {
-        _uid: operatorUid,
-        _tenant_id: version.tenant_id,
-        _required: "operator",
+        _uid:
+          operatorUid,
+        _tenant_id:
+          version.tenant_id,
+        _required:
+          "operator",
       },
     );
 
@@ -180,182 +487,383 @@ Deno.serve(async (req) => {
     }
 
     if (!allowed) {
-      await sb.from("security_events").insert({
-        tenant_id: version.tenant_id,
-        actor_user_id: operatorUid,
-        category: "authz.denied",
-        severity: "warn",
-        subject_type: "workflow_version",
-        subject_id: version.id,
-        message: "workflow execution denied: operator role required",
+      await logSecurity({
+        tenant_id:
+          version.tenant_id,
+        actor_user_id:
+          operatorUid,
+        category:
+          "authz.denied",
+        severity:
+          "warn",
+        subject_type:
+          "workflow_version",
+        subject_id:
+          version.id,
+        message:
+          "workflow execution denied: operator role required",
         details: {
-          definition_id: version.definition_id,
-          version: version.version,
+          definition_id:
+            version.definition_id,
+          version:
+            version.version,
         },
       });
 
-      return json({ error: "forbidden" }, 403);
-    }
-
-    const graph = (version.graph ?? {}) as WorkflowGraph;
-    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
-
-    if (nodes.length === 0) {
       return json(
         {
-          error: "workflow version graph contains no executable nodes",
-          version_id: version.id,
+          error:
+            "forbidden",
         },
-        409,
+        403,
       );
     }
 
     /*
-     * Root nodes are derived from the immutable published version graph.
-     * This is intentionally done before any job rows are created so the run
-     * begins with the same graph definition identified by workflow_version_id.
+     * ------------------------------------------------------------
+     * 5. Validate the immutable graph before creating anything.
+     *
+     * This prevents malformed published graphs from creating partial
+     * execution state.
+     * ------------------------------------------------------------
      */
-    const roots = nodes.filter(
-      (node) =>
-        typeof node.id === "string" &&
-        node.id.length > 0 &&
-        (!node.dependsOn || node.dependsOn.length === 0),
-    );
 
-    if (roots.length === 0) {
+    const graph =
+      version.graph ??
+      {};
+
+    const graphValidation =
+      validateGraph(graph);
+
+    if (
+      !graphValidation.ok
+    ) {
       return json(
         {
-          error: "workflow version graph has no root nodes",
-          version_id: version.id,
+          error:
+            graphValidation.error,
+          version_id:
+            version.id,
         },
         409,
       );
     }
+
+    const {
+      nodes,
+      roots,
+    } =
+      graphValidation;
+
+    /*
+     * ------------------------------------------------------------
+     * 6. Build durable run identity.
+     * ------------------------------------------------------------
+     */
 
     const runWorkflowName =
       workflowName ??
       `workflow:${version.definition_id}:v${version.version}`;
 
-    /*
-     * dag_id remains accepted as optional legacy metadata for the current
-     * worker path. Swap 2 will make run-worker resolve the graph from
-     * workflow_version_id first, eliminating mutable DAG dependence.
-     */
-    const legacyDagId =
-      typeof body.dag_id === "string" && body.dag_id.trim()
-        ? body.dag_id.trim()
-        : null;
+    const now =
+      new Date().toISOString();
 
-    const { data: runRow, error: runErr } = await sb
-      .from("workflow_runs")
+    /*
+     * IMPORTANT:
+     *
+     * No caller-provided dag_id is copied into workflow_runs.
+     *
+     * workflow_version_id is the authoritative execution reference.
+     */
+
+    const {
+      data: runRow,
+      error: runErr,
+    } = await sb
+      .from(
+        "workflow_runs",
+      )
       .insert({
-        tenant_id: version.tenant_id,
-        workflow_id: version.definition_id,
-        workflow_name: runWorkflowName,
-        dag_id: legacyDagId,
-        workflow_version_id: version.id,
-        state: "queued",
-        status: "queued",
-        correlation_id: correlationId,
+        tenant_id:
+          version.tenant_id,
+        workflow_id:
+          version.definition_id,
+        workflow_name:
+          runWorkflowName,
+        workflow_version_id:
+          version.id,
+        state:
+          "queued",
+        status:
+          "queued",
+        correlation_id:
+          correlationId,
         payload,
-        started_at: new Date().toISOString(),
+        started_at:
+          now,
       })
-      .select("id, workflow_version_id, tenant_id")
+      .select(
+        "id, workflow_version_id, tenant_id",
+      )
       .single();
 
     if (runErr) {
       throw runErr;
     }
 
-    const runId = runRow.id as string;
+    if (!runRow?.id) {
+      throw new Error(
+        "workflow run was not created",
+      );
+    }
 
-    const { error: eventErr } = await sb.from("workflow_events").insert({
-      run_id: runId,
-      tenant_id: version.tenant_id,
-      type: "run.enqueued",
-      severity: "info",
-      source: "execute-workflow",
-      message: `Run enqueued: ${runWorkflowName}`,
-      data: {
-        correlation_id: correlationId,
-        workflow_version_id: version.id,
-        definition_id: version.definition_id,
-        version: version.version,
-      },
-    });
+    runId =
+      runRow.id as string;
+
+    runTenantId =
+      version.tenant_id;
+
+    /*
+     * ------------------------------------------------------------
+     * 7. Persist launch event.
+     * ------------------------------------------------------------
+     */
+
+    const {
+      error: eventErr,
+    } = await sb
+      .from(
+        "workflow_events",
+      )
+      .insert({
+        run_id:
+          runId,
+        tenant_id:
+          version.tenant_id,
+        type:
+          "run.enqueued",
+        severity:
+          "info",
+        source:
+          "execute-workflow",
+        message:
+          `Run enqueued: ${runWorkflowName}`,
+        data: {
+          actor_user_id:
+            operatorUid,
+          correlation_id:
+            correlationId,
+          workflow_version_id:
+            version.id,
+          definition_id:
+            version.definition_id,
+          version:
+            version.version,
+          root_count:
+            roots.length,
+        },
+      });
 
     if (eventErr) {
       throw eventErr;
     }
 
-    const rows = roots.map((node) => ({
-      run_id: runId,
-      tenant_id: version.tenant_id,
-      workflow_version_id: version.id,
-      dag_node_id: node.id,
-      state: "queued" as const,
-      max_retries:
-        typeof node.maxRetries === "number" && node.maxRetries >= 0
-          ? node.maxRetries
-          : 3,
-      idempotency_key: `${runId}:${node.id}`,
-      payload: {
-        correlation_id: correlationId,
-        ...payload,
-      },
-    }));
+    /*
+     * ------------------------------------------------------------
+     * 8. Enqueue root jobs from the immutable version graph.
+     * ------------------------------------------------------------
+     */
 
-    const { error: jobsErr } = await sb
-      .from("workflow_jobs")
+    const rows =
+      roots.map(
+        (node) => ({
+          run_id:
+            runId,
+          tenant_id:
+            version.tenant_id,
+          workflow_version_id:
+            version.id,
+          dag_node_id:
+            node.id,
+          state:
+            "queued" as const,
+          max_retries:
+            typeof node.maxRetries ===
+                "number" &&
+              node.maxRetries >= 0
+              ? node.maxRetries
+              : 3,
+          idempotency_key:
+            `${runId}:${node.id}`,
+          payload: {
+            correlation_id:
+              correlationId,
+            ...payload,
+          },
+        }),
+      );
+
+    const {
+      error: jobsErr,
+    } = await sb
+      .from(
+        "workflow_jobs",
+      )
       .insert(rows);
 
     if (jobsErr) {
       throw jobsErr;
     }
 
-    const { error: runningErr } = await sb
-      .from("workflow_runs")
+    /*
+     * ------------------------------------------------------------
+     * 9. Transition the run to running only after durable jobs exist.
+     * ------------------------------------------------------------
+     */
+
+    const {
+      error: runningErr,
+    } = await sb
+      .from(
+        "workflow_runs",
+      )
       .update({
-        state: "running",
-        status: "running",
+        state:
+          "running",
+        status:
+          "running",
       })
-      .eq("id", runId)
-      .eq("workflow_version_id", version.id);
+      .eq(
+        "id",
+        runId,
+      )
+      .eq(
+        "tenant_id",
+        version.tenant_id,
+      )
+      .eq(
+        "workflow_version_id",
+        version.id,
+      );
 
     if (runningErr) {
       throw runningErr;
     }
 
     /*
-     * Kick the durable worker. This remains fire-and-forget because the
-     * workflow state is already persisted before the worker is invoked.
-     * Multiple kicks are safe because claim_next_job() uses row locking.
+     * ------------------------------------------------------------
+     * 10. Record launch completion.
+     * ------------------------------------------------------------
      */
-    const url = Deno.env.get("SUPABASE_URL")!;
-    const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-    fetch(`${url}/functions/v1/run-worker`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
+    await logSecurity({
+      tenant_id:
+        version.tenant_id,
+      actor_user_id:
+        operatorUid,
+      category:
+        "workflow.launch",
+      severity:
+        "info",
+      subject_type:
+        "workflow_run",
+      subject_id:
+        runId,
+      message:
+        "workflow execution launched",
+      details: {
+        workflow_version_id:
+          version.id,
+        definition_id:
+          version.definition_id,
+        version:
+          version.version,
+        correlation_id:
+          correlationId,
+        root_jobs:
+          rows.length,
       },
-      body: "{}",
-    }).catch((error) => {
-      console.error(
-        "[execute-workflow] worker kick failed",
-        error instanceof Error ? error.message : String(error),
-      );
     });
+
+    /*
+     * ------------------------------------------------------------
+     * 11. Kick durable worker.
+     *
+     * Fire-and-forget is intentional. Durable state already exists.
+     * Worker-side claiming is responsible for concurrency safety.
+     * ------------------------------------------------------------
+     */
+
+    const supabaseUrl =
+      Deno.env.get(
+        "SUPABASE_URL",
+      );
+
+    const serviceKey =
+      Deno.env.get(
+        "SUPABASE_SERVICE_ROLE_KEY",
+      );
+
+    if (
+      !supabaseUrl ||
+      !serviceKey
+    ) {
+      throw new Error(
+        "Supabase worker configuration is missing",
+      );
+    }
+
+    fetch(
+      `${supabaseUrl}/functions/v1/run-worker`,
+      {
+        method:
+          "POST",
+        headers: {
+          "Content-Type":
+            "application/json",
+          Authorization:
+            `Bearer ${serviceKey}`,
+        },
+        body:
+          "{}",
+      },
+    ).catch(
+      (error) => {
+        console.error(
+          "[execute-workflow] worker kick failed",
+          error instanceof Error
+            ? error.message
+            : String(error),
+        );
+      },
+    );
+
+    /*
+     * ------------------------------------------------------------
+     * 12. Return durable launch identity.
+     * ------------------------------------------------------------
+     */
 
     return json(
       {
-        run_id: runId,
-        correlation_id: correlationId,
-        workflow_version_id: version.id,
-        definition_id: version.definition_id,
-        version: version.version,
-        enqueued: rows.length,
+        run_id:
+          runId,
+        correlation_id:
+          correlationId,
+        workflow_version_id:
+          version.id,
+        definition_id:
+          version.definition_id,
+        version:
+          version.version,
+        root_jobs:
+          rows.length,
+        graph_nodes:
+          nodes.length,
+        enqueued:
+          rows.length,
+        state:
+          "running",
       },
       202,
     );
@@ -363,12 +871,100 @@ Deno.serve(async (req) => {
     const message =
       error instanceof Error
         ? error.message
-        : typeof error === "object"
-          ? JSON.stringify(error)
+        : typeof error ===
+            "object"
+          ? JSON.stringify(
+              error,
+            )
           : String(error);
 
-    console.error("[execute-workflow] error", message);
+    console.error(
+      "[execute-workflow] error",
+      message,
+    );
 
-    return json({ error: message }, 500);
+    /*
+     * If the run was created but launch preparation failed, reconcile
+     * the run instead of leaving it looking runnable forever.
+     *
+     * We intentionally do not delete the run: the failed launch is
+     * valuable audit evidence.
+     */
+    if (
+      runId &&
+      runTenantId
+    ) {
+      try {
+        await sb
+          .from(
+            "workflow_runs",
+          )
+          .update({
+            state:
+              "failed",
+            status:
+              "failed",
+            ended_at:
+              new Date().toISOString(),
+            error:
+              `Launch failed: ${message}`,
+          })
+          .eq(
+            "id",
+            runId,
+          )
+          .eq(
+            "tenant_id",
+            runTenantId,
+          );
+
+        await sb
+          .from(
+            "workflow_events",
+          )
+          .insert({
+            run_id:
+              runId,
+            tenant_id:
+              runTenantId,
+            type:
+              "run.launch_failed",
+            severity:
+              "error",
+            source:
+              "execute-workflow",
+            message:
+              "Workflow launch failed",
+            data: {
+              actor_user_id:
+                operatorUid,
+              error:
+                message,
+            },
+          });
+      } catch (
+        reconciliationError
+      ) {
+        console.error(
+          "[execute-workflow] launch reconciliation failed",
+          reconciliationError instanceof
+            Error
+            ? reconciliationError.message
+            : String(
+                reconciliationError,
+              ),
+        );
+      }
+    }
+
+    return json(
+      {
+        error:
+          message,
+        run_id:
+          runId,
+      },
+      500,
+    );
   }
 });
