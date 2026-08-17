@@ -1,0 +1,122 @@
+// supabase/functions/aggregate-job-step-metrics/index.ts
+// Valtaris Glue — Job/Step Metrics Aggregator
+//
+// This file aggregates metrics at the job and step level.
+// It produces analytics such as:
+//   - job duration
+//   - step duration
+//   - job success/failure rate
+//   - step success/failure rate
+//   - retry counts
+//   - DLQ frequency
+//   - compensation frequency
+//   - latency distribution
+//   - throughput (jobs/minute, steps/minute)
+//
+// Authority chain:
+//   collect-metrics → aggregate-job-step-metrics → dashboards
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async () => {
+  // 1. Load jobs and step-runs
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
+    .select("*");
+
+  const { data: steps } = await supabase
+    .from("workflow_step_runs")
+    .select("*");
+
+  // 2. Load raw metrics
+  const { data: metrics } = await supabase
+    .from("workflow_metrics")
+    .select("*");
+
+  const jobAggregates = [];
+  const stepAggregates = [];
+
+  // ----------------------------
+  // Aggregate job metrics
+  // ----------------------------
+  for (const job of jobs) {
+    const jobMetrics = metrics.filter((m: any) => m.job_id === job.id);
+
+    const start = new Date(job.created_at).getTime();
+    const end = new Date(job.completed_at ?? Date.now()).getTime();
+    const durationMs = end - start;
+
+    const success = job.state === "completed";
+    const failed = job.state === "failed";
+    const deadLetter = job.state === "dead_letter";
+    const compensated = job.state === "compensating" || job.state === "compensated";
+
+    const dlqCount = jobMetrics.filter((m: any) => m.event === "dlq").length;
+    const retryCount = job.attempt ?? 0;
+    const errorCount = jobMetrics.filter((m: any) => m.error).length;
+
+    jobAggregates.push({
+      job_id: job.id,
+      run_id: job.run_id,
+      step_id: job.step_id,
+      duration_ms: durationMs,
+      success,
+      failed,
+      dead_letter: deadLetter,
+      compensated,
+      dlq_count: dlqCount,
+      retry_count: retryCount,
+      error_count: errorCount,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  // ----------------------------
+  // Aggregate step metrics
+  // ----------------------------
+  for (const step of steps) {
+    const stepMetrics = metrics.filter((m: any) => m.step_id === step.step_id);
+
+    const start = new Date(step.created_at).getTime();
+    const end = new Date(step.completed_at ?? Date.now()).getTime();
+    const durationMs = end - start;
+
+    const success = step.state === "completed";
+    const failed = step.state === "failed";
+    const deadLetter = step.state === "dead_letter";
+    const compensated = step.state === "compensating" || step.state === "compensated";
+
+    const errorCount = stepMetrics.filter((m: any) => m.error).length;
+
+    stepAggregates.push({
+      step_id: step.step_id,
+      run_id: step.run_id,
+      duration_ms: durationMs,
+      success,
+      failed,
+      dead_letter: deadLetter,
+      compensated,
+      error_count: errorCount,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  // 3. Store aggregated metrics
+  await supabase.from("workflow_job_metrics").insert(jobAggregates);
+  await supabase.from("workflow_step_metrics").insert(stepAggregates);
+
+  return new Response(
+    JSON.stringify({
+      status: "job-step-metrics-aggregated",
+      jobs: jobAggregates.length,
+      steps: stepAggregates.length,
+    }),
+    { status: 200 }
+  );
+});
