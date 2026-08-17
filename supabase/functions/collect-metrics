@@ -1,0 +1,69 @@
+// supabase/functions/collect-metrics/index.ts
+// Valtaris Glue — Metrics Collector
+//
+// This file collects raw metrics emitted by the runtime.
+// It stores metrics for later aggregation.
+//
+// Metrics collected:
+//   - job execution duration
+//   - step execution duration
+//   - connector execution duration
+//   - worker execution duration
+//   - scheduler latency
+//   - stuck-run events
+//   - DLQ events
+//   - repair events
+//   - invariant violations
+//
+// Authority chain:
+//   collect-metrics → metrics tables → aggregators → dashboards
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+
+  const {
+    run_id,
+    job_id,
+    step_id,
+    connector,
+    event,
+    duration_ms,
+    error,
+    metadata,
+  } = body;
+
+  if (!event) {
+    return new Response("missing-event", { status: 400 });
+  }
+
+  await supabase.from("workflow_metrics").insert({
+    run_id,
+    job_id,
+    step_id,
+    connector,
+    event,
+    duration_ms,
+    error,
+    metadata,
+    created_at: new Date().toISOString(),
+  });
+
+  return new Response(
+    JSON.stringify({
+      status: "metric-recorded",
+      event,
+      run_id,
+      job_id,
+      step_id,
+    }),
+    { status: 200 }
+  );
+});
