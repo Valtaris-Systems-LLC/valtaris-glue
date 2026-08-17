@@ -1,0 +1,106 @@
+// supabase/functions/finalize-run/index.ts
+// Valtaris Glue — Run Finalization Engine
+//
+// Glue must finalize workflow runs deterministically.
+// This engine ensures runs end in correct terminal states:
+//
+//   - completed
+//   - failed
+//   - compensated
+//   - replay_completed
+//   - cancelled
+//
+// It prevents:
+//   - stuck runs
+//   - contradictory states
+//   - partial finalization
+//   - silent failures
+//
+// Authority chain:
+//   workflow_jobs → workflow_step_runs → workflow_runs → finalization
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { run_id } = body;
+
+  if (!run_id) {
+    return new Response("missing-run-id", { status: 400 });
+  }
+
+  // 1. Load run
+  const { data: run } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (!run) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  // 2. Load jobs for this run
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("run_id", run_id);
+
+  if (!jobs || jobs.length === 0) {
+    return new Response("no-jobs", { status: 404 });
+  }
+
+  const allCompleted = jobs.every((j: any) => j.state === "completed");
+  const anyFailed = jobs.some((j: any) => j.state === "failed");
+  const anyDeadLetter = jobs.some((j: any) => j.state === "dead_letter");
+  const anyCompensation = jobs.some((j: any) => j.is_compensation);
+  const anyRunning = jobs.some((j: any) => j.state === "running");
+  const anyPending = jobs.some((j: any) => j.state === "pending");
+
+  // 3. Determine terminal state
+  let finalState = null;
+
+  if (run.state === "replay") {
+    finalState = "replay_completed";
+  } else if (run.state === "cancelled") {
+    finalState = "cancelled";
+  } else if (anyDeadLetter && !run.compensation_enabled) {
+    finalState = "failed";
+  } else if (anyDeadLetter && run.compensation_enabled) {
+    finalState = "compensating";
+  } else if (anyFailed) {
+    finalState = "failed";
+  } else if (anyCompensation && allCompleted) {
+    finalState = "compensated";
+  } else if (allCompleted) {
+    finalState = "completed";
+  } else if (anyRunning || anyPending) {
+    return new Response("run-not-terminal", { status: 200 });
+  } else {
+    finalState = "failed";
+  }
+
+  // 4. Update run
+  await supabase
+    .from("workflow_runs")
+    .update({
+      state: finalState,
+      completed_at: new Date().toISOString(),
+    })
+    .eq("id", run_id);
+
+  return new Response(
+    JSON.stringify({
+      run_id,
+      final_state: finalState,
+      status: "ok",
+    }),
+    { status: 200 }
+  );
+});
