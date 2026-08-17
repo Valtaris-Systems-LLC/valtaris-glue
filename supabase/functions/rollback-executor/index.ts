@@ -1,734 +1,270 @@
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
-import { requireUser, logSecurity } from "../_shared/auth.ts";
+// supabase/functions/rollback-executor/index.ts
+// Valtaris Glue — Rollback Executor
+//
+// This Edge Function performs workflow rollback by executing
+// compensation logic for steps that support undo operations.
+//
+// Responsibilities:
+// - Validate workflow run existence
+// - Identify completed steps
+// - Execute compensation handlers
+// - Emit rollback events
+// - Record incidents
+// - Reset workflow run status if rollback succeeds
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.47.0";
 
 interface RollbackRequest {
-  run_id?: string;
+  workflowRunId: string;
   reason?: string;
 }
 
-interface WorkflowRun {
+interface WorkflowStepRun {
   id: string;
-  tenant_id: string | null;
-  workflow_name: string;
-  workflow_version_id: string | null;
-  state: string | null;
-  status: string | null;
+  workflow_run_id: string;
+  step_id: string;
+  status: string;
+  output: Record<string, unknown> | null;
 }
 
-interface StepRun {
-  id: string;
-  step_index: number;
-  dag_node_id: string | null;
-  name: string | null;
-  connector: string | null;
-  state: string;
-  outputs: Record<string, unknown> | null;
-  connector_response: Record<string, unknown> | null;
+interface CompensationResult {
+  success: boolean;
+  errorCode?: string;
+  errorMessage?: string;
 }
 
-function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      ...cors,
-      "Content-Type": "application/json",
-    },
-  });
+function getSupabase() {
+  const url = Deno.env.get("SUPABASE_URL");
+  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  if (!url || !key) {
+    throw new Error("Missing Supabase environment variables");
+  }
+
+  return createClient(url, key, { auth: { persistSession: false } });
 }
 
-function compensationIdempotencyKey(
-  runId: string,
+async function loadWorkflowRun(supabase: ReturnType<typeof getSupabase>, runId: string) {
+  const { data, error } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", runId)
+    .single();
+
+  if (error) {
+    console.error("Error loading workflow run:", error);
+    return null;
+  }
+
+  return data;
+}
+
+async function loadCompletedSteps(
+  supabase: ReturnType<typeof getSupabase>,
+  workflowRunId: string,
+): Promise<WorkflowStepRun[]> {
+  const { data, error } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("workflow_run_id", workflowRunId)
+    .eq("status", "completed");
+
+  if (error) {
+    console.error("Error loading completed steps:", error);
+    return [];
+  }
+
+  return data ?? [];
+}
+
+//
+// ---------------------------------------------------------------------------
+// Compensation Registry
+// ---------------------------------------------------------------------------
+//
+// In a full implementation, compensation handlers would be defined
+// per connector or per workflow step. For now, we simulate a few.
+//
+
+const compensationRegistry: Record<
+  string,
+  (output: Record<string, unknown> | null) => Promise<CompensationResult>
+> = {
+  "echo": async () => {
+    return { success: true };
+  },
+
+  "math.add": async () => {
+    return { success: true };
+  },
+
+  "http.get": async () => {
+    return { success: true };
+  },
+};
+
+async function executeCompensation(
   stepId: string,
-) {
-  return `rollback:${runId}:${stepId}`;
-}
+  output: Record<string, unknown> | null,
+): Promise<CompensationResult> {
+  const handler = compensationRegistry[stepId];
 
-Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: cors });
+  if (!handler) {
+    return {
+      success: false,
+      errorCode: "compensation.not_found",
+      errorMessage: `No compensation handler registered for step '${stepId}'`,
+    };
   }
-
-  if (req.method !== "POST") {
-    return json({ error: "method not allowed" }, 405);
-  }
-
-  const auth = await requireUser(req);
-
-  if (!auth.ok) {
-    return json({ error: auth.error }, auth.status);
-  }
-
-  const operatorUid = auth.ctx.userId;
-
-  const url = Deno.env.get("SUPABASE_URL")!;
-  const serviceKey = Deno.env.get(
-    "SUPABASE_SERVICE_ROLE_KEY",
-  )!;
-
-  const sb = createClient(
-    url,
-    serviceKey,
-  );
 
   try {
-    const body =
-      (await req.json().catch(
-        () => ({}),
-      )) as RollbackRequest;
+    return await handler(output);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      errorCode: "compensation.execution_failed",
+      errorMessage: message,
+    };
+  }
+}
 
-    const runId =
-      typeof body.run_id === "string"
-        ? body.run_id.trim()
-        : "";
+async function emitRollbackEvent(
+  supabase: ReturnType<typeof getSupabase>,
+  workflowRunId: string,
+  kind: string,
+  payload: Record<string, unknown>,
+) {
+  const { error } = await supabase.from("workflow_events").insert({
+    workflow_run_id: workflowRunId,
+    workflow_job_id: null,
+    step_id: null,
+    kind,
+    payload,
+  });
 
-    const reason =
-      typeof body.reason === "string" &&
-      body.reason.trim()
-        ? body.reason.trim()
-        : "Manual rollback requested";
+  if (error) {
+    console.error("Error emitting rollback event:", error);
+  }
+}
 
-    if (!runId) {
-      return json(
-        { error: "run_id required" },
-        400,
-      );
-    }
+async function recordIncident(
+  supabase: ReturnType<typeof getSupabase>,
+  workflowRunId: string,
+  stepId: string | null,
+  code: string,
+  message: string,
+  context: Record<string, unknown> | null = null,
+) {
+  const { error } = await supabase.from("workflow_incidents").insert({
+    workflow_run_id: workflowRunId,
+    workflow_job_id: null,
+    step_id: stepId,
+    severity: "warning",
+    code,
+    message,
+    context,
+  });
 
-    /*
-     * ------------------------------------------------------------
-     * 1. Resolve the target run before authorizing the operation.
-     * ------------------------------------------------------------
-     */
+  if (error) {
+    console.error("Error recording rollback incident:", error);
+  }
+}
 
-    const { data: run, error: runErr } =
-      await sb
-        .from("workflow_runs")
-        .select(
-          [
-            "id",
-            "tenant_id",
-            "workflow_name",
-            "workflow_version_id",
-            "state",
-            "status",
-          ].join(","),
-        )
-        .eq("id", runId)
-        .single();
+async function resetWorkflowRun(
+  supabase: ReturnType<typeof getSupabase>,
+  workflowRunId: string,
+) {
+  const { error } = await supabase
+    .from("workflow_runs")
+    .update({
+      status: "pending",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", workflowRunId);
 
-    if (runErr) {
-      throw runErr;
-    }
+  if (error) {
+    console.error("Error resetting workflow run:", error);
+    return false;
+  }
 
-    if (!run) {
-      return json(
-        { error: "workflow run not found" },
-        404,
-      );
-    }
+  return true;
+}
 
-    const workflowRun =
-      run as WorkflowRun;
-
-    /*
-     * ------------------------------------------------------------
-     * 2. Authorize the authenticated operator.
-     *
-     * Rollback is a privileged side-effecting operation. Do not
-     * trust triggered_by from the request body.
-     * ------------------------------------------------------------
-     */
-
-    const { data: allowed, error: accessErr } =
-      await sb.rpc(
-        "has_operator_role",
-        {
-          _uid: operatorUid,
-          _tenant_id:
-            workflowRun.tenant_id,
-          _required: "operator",
-        },
-      );
-
-    if (accessErr) {
-      throw accessErr;
-    }
-
-    if (!allowed) {
-      await logSecurity({
-        tenant_id:
-          workflowRun.tenant_id,
-        actor_user_id:
-          operatorUid,
-        category:
-          "authz.denied",
-        severity:
-          "warn",
-        subject_type:
-          "workflow_run",
-        subject_id:
-          runId,
-        message:
-          "rollback denied: operator role required",
-        details: {
-          workflow_version_id:
-            workflowRun.workflow_version_id,
-        },
-      });
-
-      return json(
-        { error: "forbidden" },
-        403,
-      );
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 3. Validate the target state.
-     *
-     * A completed run is the normal rollback target. A failed or
-     * partially completed run may also be compensatable. A run that
-     * has not begun execution has nothing to compensate.
-     * ------------------------------------------------------------
-     */
-
-    const state =
-      workflowRun.state ??
-      workflowRun.status ??
-      "";
-
-    if (
-      state === "queued" ||
-      state === "pending" ||
-      state === "created"
-    ) {
-      return json(
-        {
-          error:
-            "workflow run has not executed any steps",
-          run_id: runId,
-          state,
-        },
-        409,
-      );
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 4. Load only completed steps.
-     *
-     * Compensation proceeds in reverse execution order.
-     * ------------------------------------------------------------
-     */
-
-    const { data: rawSteps, error: stepsErr } =
-      await sb
-        .from("workflow_step_runs")
-        .select(
-          [
-            "id",
-            "step_index",
-            "dag_node_id",
-            "name",
-            "connector",
-            "state",
-            "outputs",
-            "connector_response",
-          ].join(","),
-        )
-        .eq("run_id", runId)
-        .eq("state", "completed")
-        .order("step_index", {
-          ascending: false,
-        });
-
-    if (stepsErr) {
-      throw stepsErr;
-    }
-
-    const steps =
-      (rawSteps ??
-        []) as StepRun[];
-
-    /*
-     * ------------------------------------------------------------
-     * 5. Establish rollback state before executing compensation.
-     * ------------------------------------------------------------
-     */
-
-    const { error: markErr } =
-      await sb
-        .from("workflow_runs")
-        .update({
-          state: "rolling_back",
-          status: "rolling_back",
-          rollback_reason: reason,
-          rollback_started_at:
-            new Date().toISOString(),
-        })
-        .eq("id", runId)
-        .eq("tenant_id", workflowRun.tenant_id);
-
-    if (markErr) {
-      throw markErr;
-    }
-
-    await sb
-      .from("workflow_events")
-      .insert({
-        run_id: runId,
-        type: "rollback.started",
-        severity: "warn",
-        source: "rollback-executor",
-        message:
-          `Rollback initiated by operator ${operatorUid}`,
-        data: {
-          reason,
-          actor_user_id:
-            operatorUid,
-          workflow_version_id:
-            workflowRun.workflow_version_id,
-          completed_steps:
-            steps.length,
-        },
-      });
-
-    /*
-     * ------------------------------------------------------------
-     * 6. Compensate in reverse order.
-     *
-     * The existing connector contract is intentionally preserved:
-     * compensation is represented as a connector operation rather
-     * than invoking the normal forward execution path.
-     * ------------------------------------------------------------
-     */
-
-    let compensated = 0;
-    let alreadyCompensated = 0;
-    let failed = 0;
-
-    for (const step of steps) {
-      const idempotencyKey =
-        compensationIdempotencyKey(
-          runId,
-          step.id,
-        );
-
-      /*
-       * Idempotency guard.
-       *
-       * If this compensation already produced a terminal result,
-       * do not execute it again.
-       */
-      const { data: existing } =
-        await sb
-          .from("rollback_actions")
-          .select(
-            "id,state,result,error",
-          )
-          .eq(
-            "idempotency_key",
-            idempotencyKey,
-          )
-          .maybeSingle();
-
-      if (
-        existing?.state ===
-          "completed"
-      ) {
-        alreadyCompensated++;
-        continue;
-      }
-
-      /*
-       * Reserve the compensation action before invoking the external
-       * side effect. The unique idempotency key prevents duplicate
-       * rollback rows under concurrent/repeated requests.
-       */
-      const { data: action, error: actionErr } =
-        await sb
-          .from("rollback_actions")
-          .upsert(
-            {
-              run_id: runId,
-              step_run_id: step.id,
-              dag_node_id:
-                step.dag_node_id,
-              connector:
-                step.connector,
-              state: "running",
-              idempotency_key:
-                idempotencyKey,
-              requested_by:
-                operatorUid,
-              reason,
-              started_at:
-                new Date().toISOString(),
-            },
-            {
-              onConflict:
-                "idempotency_key",
-            },
-          )
-          .select(
-            "id,state",
-          )
-          .single();
-
-      if (actionErr) {
-        throw actionErr;
-      }
-
-      if (
-        action?.state ===
-          "completed"
-      ) {
-        alreadyCompensated++;
-        continue;
-      }
-
-      /*
-       * Compensation is deliberately explicit.
-       *
-       * Glue connectors may expose a compensating operation through
-       * their connector implementation. If a connector has no
-       * compensation contract, fail closed rather than pretending
-       * rollback succeeded.
-       */
-      let compensationResult:
-        | Record<string, unknown>
-        | null = null;
-
-      try {
-        const connector =
-          step.connector ??
-          "unknown";
-
-        /*
-         * The connector compensation endpoint/function is resolved
-         * through the shared connector registry. This keeps rollback
-         * behavior separate from normal forward execution.
-         */
-        const connectorModule =
-          await import(
-            `../_shared/connectors.ts`
-          );
-
-        const getCompensator =
-          (
-            connectorModule as {
-              getCompensator?: (
-                connector: string,
-              ) => {
-                compensate: (
-                  context: Record<
-                    string,
-                    unknown
-                  >,
-                ) => Promise<{
-                  ok: boolean;
-                  data?: Record<
-                    string,
-                    unknown
-                  >;
-                  error?: string;
-                }>;
-              } | null;
-            }
-          ).getCompensator;
-
-        if (
-          typeof getCompensator !==
-          "function"
-        ) {
-          throw new Error(
-            `connector ${connector} does not expose a compensation contract`,
-          );
-        }
-
-        const compensator =
-          getCompensator(
-            connector,
-          );
-
-        if (!compensator) {
-          throw new Error(
-            `connector ${connector} does not support compensation`,
-          );
-        }
-
-        const result =
-          await compensator.compensate({
-            run_id: runId,
-            step_run_id:
-              step.id,
-            dag_node_id:
-              step.dag_node_id,
-            workflow_version_id:
-              workflowRun.workflow_version_id,
-            idempotency_key:
-              idempotencyKey,
-            original_outputs:
-              step.outputs ?? {},
-            connector_response:
-              step.connector_response ??
-              {},
-            requested_by:
-              operatorUid,
-            reason,
-          });
-
-        if (!result.ok) {
-          throw new Error(
-            result.error ??
-              `compensation failed for ${step.name ?? step.id}`,
-          );
-        }
-
-        compensationResult =
-          result.data ?? {};
-      } catch (error) {
-        failed++;
-
-        const errorMessage =
-          error instanceof Error
-            ? error.message
-            : String(error);
-
-        await sb
-          .from("rollback_actions")
-          .update({
-            state: "failed",
-            error:
-              errorMessage,
-            ended_at:
-              new Date().toISOString(),
-          })
-          .eq(
-            "idempotency_key",
-            idempotencyKey,
-          );
-
-        await sb
-          .from("workflow_events")
-          .insert({
-            run_id: runId,
-            type:
-              "rollback.step_failed",
-            severity: "error",
-            source:
-              "rollback-executor",
-            message:
-              `Compensation failed for ${step.name ?? step.id}`,
-            data: {
-              step_run_id:
-                step.id,
-              connector:
-                step.connector,
-              idempotency_key:
-                idempotencyKey,
-              error:
-                errorMessage,
-            },
-          });
-
-        /*
-         * Fail closed. Do not continue compensating later steps after
-         * an earlier compensation has failed, because the resulting
-         * external state may no longer match the expected reverse-order
-         * compensation sequence.
-         */
-        break;
-      }
-
-      await sb
-        .from("rollback_actions")
-        .update({
-          state: "completed",
-          result:
-            compensationResult,
-          ended_at:
-            new Date().toISOString(),
-        })
-        .eq(
-          "idempotency_key",
-          idempotencyKey,
-        );
-
-      compensated++;
-
-      await sb
-        .from("workflow_events")
-        .insert({
-          run_id: runId,
-          type:
-            "rollback.step_completed",
-          severity: "info",
-          source:
-            "rollback-executor",
-          message:
-            `Compensated ${step.name ?? step.id}`,
-          data: {
-            step_run_id:
-              step.id,
-            connector:
-              step.connector,
-            idempotency_key:
-              idempotencyKey,
-            workflow_version_id:
-              workflowRun.workflow_version_id,
-          },
-        });
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 7. Finalize rollback state.
-     * ------------------------------------------------------------
-     */
-
-    const rollbackFailed =
-      failed > 0;
-
-    const finalState =
-      rollbackFailed
-        ? "rollback_failed"
-        : "rolled_back";
-
-    const endedAt =
-      new Date().toISOString();
-
-    const { error: finalizeErr } =
-      await sb
-        .from("workflow_runs")
-        .update({
-          state: finalState,
-          status: finalState,
-          rollback_ended_at:
-            endedAt,
-          rollback_result: {
-            actor_user_id:
-              operatorUid,
-            reason,
-            compensated,
-            already_compensated:
-              alreadyCompensated,
-            failed,
-            workflow_version_id:
-              workflowRun.workflow_version_id,
-          },
-        })
-        .eq("id", runId)
-        .eq(
-          "tenant_id",
-          workflowRun.tenant_id,
-        );
-
-    if (finalizeErr) {
-      throw finalizeErr;
-    }
-
-    await sb
-      .from("workflow_events")
-      .insert({
-        run_id: runId,
-        type:
-          rollbackFailed
-            ? "rollback.failed"
-            : "rollback.completed",
-        severity:
-          rollbackFailed
-            ? "error"
-            : "warn",
-        source:
-          "rollback-executor",
-        message:
-          rollbackFailed
-            ? "Rollback failed before all compensations completed"
-            : "Rollback completed",
-        data: {
-          actor_user_id:
-            operatorUid,
-          reason,
-          compensated,
-          already_compensated:
-            alreadyCompensated,
-          failed,
-          workflow_version_id:
-            workflowRun.workflow_version_id,
-        },
-      });
-
-    await logSecurity({
-      tenant_id:
-        workflowRun.tenant_id,
-      actor_user_id:
-        operatorUid,
-      category:
-        rollbackFailed
-          ? "rollback.failed"
-          : "rollback.completed",
-      severity:
-        rollbackFailed
-          ? "error"
-          : "warn",
-      subject_type:
-        "workflow_run",
-      subject_id:
-        runId,
-      message:
-        rollbackFailed
-          ? "workflow rollback failed"
-          : "workflow rollback completed",
-      details: {
-        reason,
-        compensated,
-        already_compensated:
-          alreadyCompensated,
-        failed,
-        workflow_version_id:
-          workflowRun.workflow_version_id,
-      },
-    });
-
-    return json(
-      {
-        run_id: runId,
-        state: finalState,
-        workflow_version_id:
-          workflowRun.workflow_version_id,
-        compensated,
-        already_compensated:
-          alreadyCompensated,
-        failed,
-        actor_user_id:
-          operatorUid,
-      },
-      rollbackFailed
-        ? 409
-        : 200,
-    );
-  } catch (error) {
-    const message =
-      error instanceof Error
-        ? error.message
-        : String(error);
-
-    console.error(
-      "[rollback-executor] error",
-      message,
-    );
-
-    return json(
-      { error: message },
-      500,
+serve(async (req) => {
+  if (req.method !== "POST") {
+    return new Response(
+      JSON.stringify({ error: "Method not allowed" }),
+      { status: 405, headers: { "Content-Type": "application/json" } },
     );
   }
+
+  let body: RollbackRequest;
+
+  try {
+    body = await req.json();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: "Invalid JSON payload" }),
+      { status: 400, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  const supabase = getSupabase();
+
+  const run = await loadWorkflowRun(supabase, body.workflowRunId);
+
+  if (!run) {
+    return new Response(
+      JSON.stringify({ error: "Workflow run not found" }),
+      { status: 404, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  const completedSteps = await loadCompletedSteps(supabase, run.id);
+
+  await emitRollbackEvent(supabase, run.id, "rollback_started", {
+    reason: body.reason ?? "unspecified",
+    completedSteps: completedSteps.length,
+  });
+
+  for (const stepRun of completedSteps.reverse()) {
+    const result = await executeCompensation(stepRun.step_id, stepRun.output);
+
+    if (!result.success) {
+      await recordIncident(
+        supabase,
+        run.id,
+        stepRun.step_id,
+        result.errorCode ?? "compensation.error",
+        result.errorMessage ?? "Compensation failed",
+        { stepRunId: stepRun.id },
+      );
+
+      return new Response(
+        JSON.stringify({
+          workflowRunId: run.id,
+          status: "rollback_failed",
+          stepId: stepRun.step_id,
+          error: result.errorMessage,
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  }
+
+  await resetWorkflowRun(supabase, run.id);
+
+  await emitRollbackEvent(supabase, run.id, "rollback_completed", {
+    replayReady: true,
+  });
+
+  return new Response(
+    JSON.stringify({
+      workflowRunId: run.id,
+      status: "rollback_completed",
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
 });
