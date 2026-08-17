@@ -1,0 +1,88 @@
+// supabase/functions/worker-finalize/index.ts
+// Valtaris Glue — Unified Worker Finalization Engine
+//
+// This file finalizes job execution deterministically.
+// It enforces:
+//   - job lifecycle correctness
+//   - step lifecycle correctness
+//   - run lifecycle correctness
+//   - DLQ safety
+//   - compensation safety
+//   - scheduler continuation
+//
+// Authority chain:
+//   worker-integrate → worker-finalize → lifecycle engines → scheduler
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+serve(async (req) => {
+  const body = await req.json();
+  const { job_id, run_id, step_id, success, error } = body;
+
+  if (!job_id || !run_id || !step_id) {
+    return new Response("missing-required-fields", { status: 400 });
+  }
+
+  // 1. Update job lifecycle
+  if (success) {
+    await supabase.functions.invoke("job-lifecycle", {
+      body: { job_id, action: "complete" },
+    });
+
+    await supabase.functions.invoke("step-lifecycle", {
+      body: { run_id, step_id, action: "complete" },
+    });
+  } else {
+    await supabase.functions.invoke("job-lifecycle", {
+      body: { job_id, action: "fail", error },
+    });
+
+    await supabase.functions.invoke("step-lifecycle", {
+      body: { run_id, step_id, action: "fail", error },
+    });
+
+    // DLQ entry
+    await supabase.functions.invoke("dead-letter", {
+      body: { job_id, run_id, step_id, error },
+    });
+
+    // Compensation if enabled
+    const { data: run } = await supabase
+      .from("workflow_runs")
+      .select("*")
+      .eq("id", run_id)
+      .single();
+
+    if (run?.compensation_enabled) {
+      await supabase.functions.invoke("compensate-step", {
+        body: { run_id, step_id, payload: {} },
+      });
+    }
+  }
+
+  // 2. Finalize run if terminal
+  await supabase.functions.invoke("finalize-run", {
+    body: { run_id },
+  });
+
+  // 3. Schedule next job
+  await supabase.functions.invoke("schedule-next-job", {
+    body: { run_id },
+  });
+
+  return new Response(
+    JSON.stringify({
+      job_id,
+      run_id,
+      step_id,
+      status: success ? "job-completed" : "job-failed",
+    }),
+    { status: 200 }
+  );
+});
