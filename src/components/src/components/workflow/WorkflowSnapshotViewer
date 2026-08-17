@@ -1,0 +1,65 @@
+// src/components/workflow/WorkflowSnapshotViewer.tsx
+// Valtaris Glue — Workflow Snapshot Viewer
+//
+// Displays workflow snapshots:
+// - state snapshots
+// - payload snapshots
+// - timestamps
+// - diff-friendly formatting
+//
+// This is the UI component for inspecting workflow snapshots.
+
+import React, { useState } from "react";
+
+export interface WorkflowSnapshot {
+  id: string;
+  timestamp: string;
+  state: Record<string, unknown>;
+}
+
+interface WorkflowSnapshotViewerProps {
+  snapshots: WorkflowSnapshot[];
+}
+
+export function WorkflowSnapshotViewer({ snapshots }: WorkflowSnapshotViewerProps) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const toggle = (id: string) => {
+    setExpanded(expanded === id ? null : id);
+  };
+
+  return (
+    <div className="border rounded-lg p-4 bg-white shadow-sm">
+      <h2 className="text-lg font-semibold mb-4">Snapshots</h2>
+
+      <div className="space-y-4">
+        {snapshots.map((snap) => (
+          <div
+            key={snap.id}
+            className="border rounded p-3 bg-gray-50 shadow-sm"
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <p className="font-medium text-gray-800">Snapshot {snap.id}</p>
+                <p className="text-xs text-gray-500">{snap.timestamp}</p>
+              </div>
+
+              <button
+                onClick={() => toggle(snap.id)}
+                className="text-blue-600 hover:text-blue-800 text-sm"
+              >
+                {expanded === snap.id ? "Hide" : "View"}
+              </button>
+            </div>
+
+            {expanded === snap.id && (
+              <pre className="mt-3 bg-white p-3 rounded text-xs overflow-auto border">
+                {JSON.stringify(snap.state, null, 2)}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
