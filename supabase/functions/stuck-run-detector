@@ -1,0 +1,119 @@
+// supabase/functions/stuck-run-detector/index.ts
+// Valtaris Glue — Stuck Run Detector
+//
+// This file detects workflow runs that are stuck or not progressing.
+// It triggers automatic repair and recovery.
+//
+// A run is considered stuck if:
+//   - no jobs have progressed for > 30 seconds
+//   - a job is leased past expiration
+//   - a step-run is running past worker-timeout
+//   - the run is "running" but has no runnable jobs
+//   - the run is non-terminal but all jobs are terminal
+//
+// Authority chain:
+//   stuck-run-detector → repair-run → check-invariants → audit-run → scheduler → finalization
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const STUCK_THRESHOLD_MS = 30000; // 30 seconds
+
+serve(async () => {
+  const now = Date.now();
+
+  // 1. Load all non-terminal runs
+  const { data: runs } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .not("state", "in", ["completed", "failed", "cancelled", "compensated", "replay_completed"]);
+
+  const stuck = [];
+
+  for (const run of runs) {
+    const { data: jobs } = await supabase
+      .from("workflow_jobs")
+      .select("*")
+      .eq("run_id", run.id);
+
+    const { data: steps } = await supabase
+      .from("workflow_step_runs")
+      .select("*")
+      .eq("run_id", run.id);
+
+    const lastProgress = Math.max(
+      ...jobs.map((j: any) => new Date(j.updated_at ?? j.created_at).getTime()),
+      ...steps.map((s: any) => new Date(s.updated_at ?? s.created_at).getTime())
+    );
+
+    const noProgressTooLong = now - lastProgress > STUCK_THRESHOLD_MS;
+
+    const hasStuckLease = jobs.some(
+      (j: any) =>
+        j.state === "leased" &&
+        new Date(j.lease_expires_at).getTime() < now
+    );
+
+    const hasStuckStep = steps.some(
+      (s: any) =>
+        s.state === "running" &&
+        new Date(s.started_at).getTime() < now - STUCK_THRESHOLD_MS
+    );
+
+    const allTerminal = jobs.every((j: any) =>
+      ["completed", "failed", "dead_letter", "compensated"].includes(j.state)
+    );
+
+    const hasRunnable = jobs.some((j: any) => j.state === "pending");
+
+    const runIsStuck =
+      noProgressTooLong ||
+      hasStuckLease ||
+      hasStuckStep ||
+      (run.state === "running" && !hasRunnable) ||
+      (!allTerminal && !hasRunnable);
+
+    if (runIsStuck) {
+      stuck.push(run.id);
+
+      // 2. Repair run
+      await supabase.functions.invoke("repair-run", {
+        body: { run_id: run.id },
+      });
+
+      // 3. Check invariants
+      await supabase.functions.invoke("check-invariants", {
+        body: { run_id: run.id },
+      });
+
+      // 4. Audit run
+      await supabase.functions.invoke("audit-run", {
+        body: { run_id: run.id },
+      });
+
+      // 5. Finalize if needed
+      await supabase.functions.invoke("finalize-run", {
+        body: { run_id: run.id },
+      });
+
+      // 6. Schedule next job
+      await supabase.functions.invoke("schedule-next-job", {
+        body: { run_id: run.id },
+      });
+    }
+  }
+
+  return new Response(
+    JSON.stringify({
+      stuck_runs: stuck,
+      count: stuck.length,
+      status: "stuck-run-scan-complete",
+    }),
+    { status: 200 }
+  );
+});
