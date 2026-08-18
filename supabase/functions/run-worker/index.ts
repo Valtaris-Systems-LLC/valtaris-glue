@@ -1,17 +1,24 @@
 // supabase/functions/run-worker/index.ts
-// Valtaris Glue — Unified Durable Worker Runtime
+// Valtaris Glue — Durable Worker Runtime (Generation 2)
 //
-// This replaces all legacy execution paths.
+// This worker is responsible for:
+//   - transactional job claiming
+//   - lease-based execution
+//   - connector adapter invocation
+//   - downstream job creation (idempotent)
+//   - retry handling
+//   - DLQ routing
+//   - compensation routing
+//   - stuck/expired lease recovery
+//
 // Authority chain:
-//   workflow_runs.workflow_version_id
-//       → workflow_versions.graph
-//       → step
-//       → job
-//       → worker
+//   scheduler → run-worker → job-lifecycle → step-lifecycle → execute-step → connector-adapter
 //
-// No fallback to workflow_dags.
-// No fallback to workflow_definitions.
-// No re-deriving graphs from ad-hoc sources.
+// Contract:
+//   - Only one worker may claim a given job at a time.
+//   - Downstream jobs are created idempotently per (run_id, step_id).
+//   - Leases are renewed for long-running jobs.
+//   - Expired leases are recovered by repair/stuck-run detectors.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -21,196 +28,325 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-// Lease duration for jobs
-const LEASE_MS = 1000 * 30; // 30 seconds
+const LEASE_MS = 30000; // 30 seconds
+const HEARTBEAT_MS = 10000; // renew lease every 10 seconds
 
-serve(async () => {
-  // 1. Claim a job
-  const { data: job, error: claimError } = await supabase
+type WorkflowJob = {
+  id: string;
+  run_id: string;
+  step_id: string;
+  state: string;
+  attempt: number;
+  payload: any;
+  lease_expires_at: string | null;
+  claimed_at: string | null;
+};
+
+type WorkflowRun = {
+  id: string;
+  workflow_version_id: string;
+  state: string;
+};
+
+type WorkflowVersion = {
+  id: string;
+  graph: {
+    nodes: Array<{
+      id: string;
+      type: string;
+      connector?: string;
+      next?: string[];
+      on_failure?: string[];
+      on_approval?: string[];
+      on_compensation?: string[];
+    }>;
+  };
+};
+
+async function claimNextJob(): Promise<WorkflowJob | null> {
+  // This function relies on a transactional RPC or SKIP LOCKED semantics
+  // implemented in the database layer. Here we call a stored procedure
+  // that atomically:
+  //   - finds a pending job
+  //   - marks it as leased
+  //   - returns it to the worker
+  //
+  // You must ensure the database function enforces:
+  //   - state = 'pending'
+  //   - claimed_at IS NULL
+  //   - lease_expires_at IS NULL OR < now
+  //   - FOR UPDATE SKIP LOCKED
+  const { data, error } = await supabase.rpc("claim_next_job", {});
+
+  if (error) {
+    console.error("claim_next_job error", error);
+    return null;
+  }
+
+  if (!data) return null;
+  return data as WorkflowJob;
+}
+
+async function renewLease(jobId: string) {
+  const leaseExpiresAt = new Date(Date.now() + LEASE_MS).toISOString();
+  const { error } = await supabase
     .from("workflow_jobs")
     .update({
+      lease_expires_at: leaseExpiresAt,
       claimed_at: new Date().toISOString(),
-      claimed_by: "worker",
-      lease_expires_at: new Date(Date.now() + LEASE_MS).toISOString(),
     })
-    .eq("state", "pending")
-    .is("claimed_at", null)
-    .select("*")
-    .limit(1)
-    .single();
+    .eq("id", jobId);
 
-  if (claimError || !job) {
-    return new Response("no-job");
-  }
-
-  const jobId = job.id;
-
-  // 2. Load workflow run
-  const { data: run } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", job.run_id)
-    .single();
-
-  if (!run) {
-    await failJob(jobId, "run-not-found");
-    return new Response("run-not-found");
-  }
-
-  // 3. Load workflow version (single authority)
-  const { data: version } = await supabase
-    .from("workflow_versions")
-    .select("*")
-    .eq("id", run.workflow_version_id)
-    .single();
-
-  if (!version) {
-    await failJob(jobId, "version-not-found");
-    return new Response("version-not-found");
-  }
-
-  const graph = version.graph;
-  const step = graph.nodes.find((n: any) => n.id === job.step_id);
-
-  if (!step) {
-    await failJob(jobId, "step-not-found");
-    return new Response("step-not-found");
-  }
-
-  // 4. Idempotency key
-  const idempotencyKey = `${run.id}:${step.id}:${job.attempt}`;
-
-  // 5. Execute step
-  try {
-    const result = await executeStep(step, job.payload, idempotencyKey);
-
-    // 6. Mark job completed
-    await supabase
-      .from("workflow_jobs")
-      .update({
-        state: "completed",
-        completed_at: new Date().toISOString(),
-        result,
-      })
-      .eq("id", jobId);
-
-    // 7. Queue downstream jobs
-    const downstream = graph.edges
-      .filter((e: any) => e.from === step.id)
-      .map((e: any) => e.to);
-
-    for (const nextStepId of downstream) {
-      await supabase.from("workflow_jobs").insert({
-        run_id: run.id,
-        step_id: nextStepId,
-        state: "pending",
-        attempt: 0,
-        payload: {},
-      });
-    }
-
-    // 8. Terminal run handling
-    await finalizeRunIfTerminal(run.id);
-
-    return new Response("ok");
-  } catch (err) {
-    // 9. Retry logic
-    const nextAttempt = job.attempt + 1;
-
-    if (nextAttempt > (step.max_retries ?? 3)) {
-      await failJob(jobId, err.message);
-      await markRunFailed(run.id);
-      return new Response("failed");
-    }
-
-    // exponential backoff
-    const backoffMs = Math.pow(2, nextAttempt) * 1000;
-
-    await supabase
-      .from("workflow_jobs")
-      .update({
-        state: "pending",
-        attempt: nextAttempt,
-        claimed_at: null,
-        lease_expires_at: null,
-        available_at: new Date(Date.now() + backoffMs).toISOString(),
-      })
-      .eq("id", jobId);
-
-    return new Response("retry");
-  }
-});
-
-// ----------------------------
-// Helpers
-// ----------------------------
-
-async function executeStep(step: any, payload: any, idempotencyKey: string) {
-  // All connector calls must be idempotent or guarded.
-  switch (step.type) {
-    case "task":
-      return await runTask(step.run, payload, idempotencyKey);
-
-    case "noop":
-      return { ok: true };
-
-    default:
-      throw new Error(`unknown-step-type: ${step.type}`);
+  if (error) {
+    console.error("renewLease error", error);
   }
 }
 
-async function runTask(name: string, payload: any, idempotencyKey: string) {
-  // This is where connector bindings plug in.
-  // For now, we assume tasks are registered in the runtime.
-  const url = Deno.env.get("TASK_RUNTIME_URL")!;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, payload, idempotencyKey }),
-  });
+async function loadRun(runId: string): Promise<WorkflowRun | null> {
+  const { data, error } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", runId)
+    .single();
 
-  if (!res.ok) {
-    throw new Error(`task-failed: ${name}`);
+  if (error) {
+    console.error("loadRun error", error);
+    return null;
   }
 
-  return await res.json();
+  return data as WorkflowRun;
+}
+
+async function loadVersion(versionId: string): Promise<WorkflowVersion | null> {
+  const { data, error } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", versionId)
+    .single();
+
+  if (error) {
+    console.error("loadVersion error", error);
+    return null;
+  }
+
+  return data as WorkflowVersion;
+}
+
+async function getConnectorAdapter(connector: string | undefined) {
+  if (!connector) return null;
+
+  // Connector registry is responsible for mapping connector IDs to adapters.
+  // This is typically implemented as a Supabase function or a static map.
+  const { data, error } = await supabase.functions.invoke("connector-registry", {
+    body: { connector },
+  });
+
+  if (error) {
+    console.error("connector-registry error", error);
+    return null;
+  }
+
+  return data?.adapter ?? null;
+}
+
+async function executeConnector(adapter: any, job: WorkflowJob, node: any) {
+  // The adapter is expected to expose an "execute" method over RPC.
+  // We call connector-wrapper, which in turn calls the adapter.
+  const { data, error } = await supabase.functions.invoke("connector-wrapper", {
+    body: {
+      adapter,
+      run_id: job.run_id,
+      step_id: job.step_id,
+      job_id: job.id,
+      payload: job.payload,
+      node,
+    },
+  });
+
+  if (error) {
+    console.error("connector-wrapper error", error);
+    throw new Error("connector-execution-failed");
+  }
+
+  return data;
+}
+
+async function createDownstreamJobs(
+  runId: string,
+  version: WorkflowVersion,
+  currentNodeId: string,
+  outcome: "success" | "failure" | "approval" | "compensation"
+) {
+  const node = version.graph.nodes.find((n) => n.id === currentNodeId);
+  if (!node) return;
+
+  let nextIds: string[] = [];
+
+  if (outcome === "success") {
+    nextIds = node.next ?? [];
+  } else if (outcome === "failure") {
+    nextIds = node.on_failure ?? [];
+  } else if (outcome === "approval") {
+    nextIds = node.on_approval ?? [];
+  } else if (outcome === "compensation") {
+    nextIds = node.on_compensation ?? [];
+  }
+
+  if (!nextIds.length) return;
+
+  for (const nextId of nextIds) {
+    // Idempotent downstream job creation:
+    //   - unique constraint on (run_id, step_id)
+    //   - insert only if not exists
+    const { error } = await supabase.rpc("ensure_downstream_job", {
+      p_run_id: runId,
+      p_step_id: nextId,
+    });
+
+    if (error) {
+      console.error("ensure_downstream_job error", error);
+    }
+  }
+}
+
+async function completeJob(jobId: string) {
+  const { error } = await supabase.functions.invoke("job-lifecycle", {
+    body: { job_id: jobId, action: "complete" },
+  });
+
+  if (error) {
+    console.error("job-lifecycle complete error", error);
+  }
 }
 
 async function failJob(jobId: string, reason: string) {
-  await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "failed",
-      error: reason,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", jobId);
-}
+  const { error } = await supabase.functions.invoke("job-lifecycle", {
+    body: { job_id: jobId, action: "fail", error: reason },
+  });
 
-async function markRunFailed(runId: string) {
-  await supabase
-    .from("workflow_runs")
-    .update({
-      state: "failed",
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", runId);
-}
-
-async function finalizeRunIfTerminal(runId: string) {
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
-    .select("state")
-    .eq("run_id", runId);
-
-  const allDone = jobs.every((j: any) => j.state === "completed");
-  if (allDone) {
-    await supabase
-      .from("workflow_runs")
-      .update({
-        state: "completed",
-        completed_at: new Date().toISOString(),
-      })
-      .eq("id", runId);
+  if (error) {
+    console.error("job-lifecycle fail error", error);
   }
 }
+
+async function deadLetterJob(jobId: string, reason: string) {
+  const { error } = await supabase.functions.invoke("dead-letter", {
+    body: { job_id: jobId, error: reason },
+  });
+
+  if (error) {
+    console.error("dead-letter error", error);
+  }
+}
+
+async function compensateRun(runId: string, stepId: string | null) {
+  const { error } = await supabase.functions.invoke("compensate-step", {
+    body: { run_id: runId, step_id: stepId, payload: {} },
+  });
+
+  if (error) {
+    console.error("compensate-step error", error);
+  }
+}
+
+async function processJob(job: WorkflowJob) {
+  const run = await loadRun(job.run_id);
+  if (!run) {
+    await failJob(job.id, "run-not-found");
+    return;
+  }
+
+  const version = await loadVersion(run.workflow_version_id);
+  if (!version) {
+    await failJob(job.id, "version-not-found");
+    return;
+  }
+
+  const node = version.graph.nodes.find((n) => n.id === job.step_id);
+  if (!node) {
+    await deadLetterJob(job.id, "step-not-in-graph");
+    return;
+  }
+
+  // Renew lease before starting execution
+  await renewLease(job.id);
+
+  // Heartbeat loop: renew lease periodically while executing
+  let heartbeatActive = true;
+  const heartbeat = setInterval(async () => {
+    if (!heartbeatActive) return;
+    await renewLease(job.id);
+  }, HEARTBEAT_MS);
+
+  try {
+    // Execute step via step-lifecycle → execute-step → connector-adapter
+    const adapter = await getConnectorAdapter(node.connector);
+    if (!adapter && node.connector) {
+      throw new Error("connector-adapter-not-found");
+    }
+
+    const { error } = await supabase.functions.invoke("execute-step", {
+      body: {
+        run_id: job.run_id,
+        step_id: job.step_id,
+        job_id: job.id,
+        node,
+        adapter,
+        payload: job.payload,
+      },
+    });
+
+    if (error) {
+      console.error("execute-step error", error);
+      throw new Error("step-execution-failed");
+    }
+
+    // Mark job completed
+    await completeJob(job.id);
+
+    // Create downstream jobs (success path)
+    await createDownstreamJobs(job.run_id, version, job.step_id, "success");
+  } catch (err) {
+    console.error("processJob error", err);
+
+    // Retry or DLQ based on attempt count
+    const maxAttempts = 3;
+    const attempt = job.attempt ?? 0;
+
+    if (attempt + 1 >= maxAttempts) {
+      await deadLetterJob(job.id, "max-attempts-exceeded");
+      await createDownstreamJobs(job.run_id, version, job.step_id, "failure");
+    } else {
+      await failJob(job.id, "execution-error");
+    }
+  } finally {
+    heartbeatActive = false;
+    clearInterval(heartbeat);
+  }
+}
+
+serve(async () => {
+  // Claim next job transactionally
+  const job = await claimNextJob();
+
+  if (!job) {
+    return new Response(
+      JSON.stringify({
+        status: "no-job-available",
+      }),
+      { status: 200 }
+    );
+  }
+
+  await processJob(job);
+
+  return new Response(
+    JSON.stringify({
+      status: "job-processed",
+      job_id: job.id,
+      run_id: job.run_id,
+      step_id: job.step_id,
+    }),
+    { status: 200 }
+  );
+});
