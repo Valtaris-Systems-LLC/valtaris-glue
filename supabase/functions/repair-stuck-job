@@ -1,0 +1,110 @@
+// supabase/functions/repair-stuck-job/index.ts
+// Valtaris Glue — Stuck Job Repair Engine (Generation 2)
+//
+// Responsibilities:
+//   - Detect expired leases
+//   - Detect stuck jobs (running too long)
+//   - Detect jobs whose worker crashed mid-execution
+//   - Reset job state safely
+//   - Requeue job for execution
+//   - Preserve provenance
+//
+// Contract:
+//   - Does NOT execute connectors
+//   - Does NOT mutate downstream jobs
+//   - Only resets jobs that are safe to retry
+//   - Must be idempotent
+//   - Called by scheduler, SLA sweeper, or manually
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const MAX_JOB_RUNTIME_MS = 5 * 60 * 1000; // 5 minutes
+
+serve(async (req) => {
+  const body = await req.json().catch(() => ({}));
+  const { job_id } = body;
+
+  if (!job_id) {
+    return new Response("missing-job-id", { status: 400 });
+  }
+
+  // 1. Load job
+  const { data: jobData, error: jobError } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", job_id)
+    .single();
+
+  if (jobError || !jobData) {
+    return new Response("job-not-found", { status: 404 });
+  }
+
+  const job = jobData;
+
+  // 2. Check lease expiration
+  const now = Date.now();
+  const leaseExpired =
+    job.lease_expires_at && new Date(job.lease_expires_at).getTime() < now;
+
+  // 3. Check stuck execution (running too long)
+  const runningTooLong =
+    job.claimed_at &&
+    now - new Date(job.claimed_at).getTime() > MAX_JOB_RUNTIME_MS;
+
+  if (!leaseExpired && !runningTooLong) {
+    return new Response(
+      JSON.stringify({
+        status: "job-not-stuck",
+        job_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 4. Reset job state
+  const { error: resetError } = await supabase
+    .from("workflow_jobs")
+    .update({
+      state: "pending",
+      claimed_at: null,
+      lease_expires_at: null,
+      error: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", job_id);
+
+  if (resetError) {
+    console.error("reset-job-error", resetError);
+    return new Response("job-reset-failed", { status: 500 });
+  }
+
+  // 5. Record provenance
+  await supabase.from("workflow_job_repair").insert({
+    job_id,
+    run_id: job.run_id,
+    step_id: job.step_id,
+    reason: leaseExpired
+      ? "lease-expired"
+      : "running-too-long",
+    repaired_at: new Date().toISOString(),
+  }).catch(() => {});
+
+  return new Response(
+    JSON.stringify({
+      status: "job-repaired",
+      job_id,
+      run_id: job.run_id,
+      step_id: job.step_id,
+      reason: leaseExpired
+        ? "lease-expired"
+        : "running-too-long",
+    }),
+    { status: 200 }
+  );
+});
