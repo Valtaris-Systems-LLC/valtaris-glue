@@ -1,19 +1,21 @@
-// supabase/functions/schedule-next-job/index.ts
-// Valtaris Glue — Unified Scheduler
+// supabase/functions/init-workflow/index.ts
+// Valtaris Glue — Workflow Run Initializer (Generation 3)
 //
-// This file selects the next runnable job for a workflow run.
-// It enforces:
-//   - graph authority
-//   - version authority
-//   - job lifecycle correctness
-//   - step lifecycle correctness
-//   - DLQ safety
-//   - compensation safety
-//   - idempotency safety
-//   - worker-timeout safety
+// This file is responsible for:
+//   - creating workflow_runs
+//   - pinning workflow_version_id
+//   - storing initial input
+//   - emitting workflow.created events
+//   - handing off to execute-workflow
 //
 // Authority chain:
-//   schedule-next-job → job-lifecycle → worker-integrate → connector-wrapper
+//   workflow-publish → init-workflow → execute-workflow → ensure_downstream_job
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -24,92 +26,86 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id } = body;
+  try {
+    const body = await req.json();
+    const { workflow_version_id, input } = body;
 
-  if (!run_id) {
-    return new Response("missing-run-id", { status: 400 });
+    if (!workflow_version_id) {
+      return jsonError("missing-workflow-version-id", 400);
+    }
+
+    const version = await loadVersion(workflow_version_id);
+    if (!version) return jsonError("version-not-found", 404);
+
+    // Create run
+    const run_id = crypto.randomUUID();
+
+    await supabase.from("workflow_runs").insert({
+      id: run_id,
+      workflow_version_id,
+      state: "created",
+      input: input ?? {},
+      created_at: new Date(),
+    });
+
+    // Emit workflow.created event
+    await supabase.from("workflow_events").insert({
+      run_id,
+      step_id: null,
+      type: "workflow.created",
+      details: { workflow_version_id },
+      created_at: new Date(),
+    });
+
+    // Immediately hand off to execute-workflow
+    await supabase.functions.invoke("execute-workflow", {
+      body: { run_id },
+    });
+
+    return jsonOK({
+      status: "workflow-initialized",
+      run_id,
+      workflow_version_id,
+    });
+  } catch (err) {
+    console.error("init-workflow fatal error:", err);
+    return jsonError("init-workflow-failed", 500, err);
   }
+});
 
-  // 1. Load run
-  const { data: run } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", run_id)
-    .single();
+// ------------------------------------------------------------
+// Load Version
+// ------------------------------------------------------------
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  // 2. Load workflow version
-  const { data: version } = await supabase
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
     .from("workflow_versions")
     .select("*")
-    .eq("id", run.workflow_version_id)
+    .eq("id", versionId)
     .single();
+  return data ?? null;
+}
 
-  if (!version) {
-    return new Response("version-not-found", { status: 404 });
-  }
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  const graph = version.graph;
-
-  // 3. Load jobs for this run
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("run_id", run_id);
-
-  // 4. Find runnable job
-  const runnable = jobs.find((j: any) => j.state === "pending");
-
-  if (!runnable) {
-    return new Response(
-      JSON.stringify({
-        run_id,
-        status: "no-runnable-jobs",
-      }),
-      { status: 200 }
-    );
-  }
-
-  // 5. Lease job
-  await supabase.functions.invoke("job-lifecycle", {
-    body: { job_id: runnable.id, action: "lease" },
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
   });
+}
 
-  // 6. Mark step as running
-  await supabase.functions.invoke("step-lifecycle", {
-    body: {
-      run_id,
-      step_id: runnable.step_id,
-      action: "start",
-    },
-  });
-
-  // 7. Dispatch job to worker
-  const workerRes = await supabase.functions.invoke("worker-integrate", {
-    body: {
-      job_id: runnable.id,
-      run_id,
-      step_id: runnable.step_id,
-      connector: graph.nodes.find((n: any) => n.id === runnable.step_id)?.connector,
-      payload: runnable.payload,
-      workflow_version_id: run.workflow_version_id,
-    },
-  });
-
-  const workerResult = await workerRes.json();
-
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      job_id: runnable.id,
-      step_id: runnable.step_id,
-      worker: workerResult,
-      status: "scheduled",
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
