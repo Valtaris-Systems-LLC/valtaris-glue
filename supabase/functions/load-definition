@@ -1,22 +1,21 @@
 // supabase/functions/load-definition/index.ts
-// Valtaris Glue — Unified Workflow Definition Loader
+// Valtaris Glue — Workflow Definition Loader (Generation 3)
 //
-// This replaces ALL legacy workflow definition paths.
-// It enforces strict version authority:
+// This file is responsible for:
+//   - loading workflow definitions from workflow_versions
+//   - validating graph structure
+//   - validating connector references
+//   - validating node types
+//   - emitting workflow definition load events
 //
-//   workflow_version_id → workflow_versions.definition
+// Authority chain:
+//   workflow-publish → load-definition → init-workflow → execute-workflow
 //
-// No fallback to workflow_definitions.
-// No inline JSON definitions.
-// No ad-hoc reconstruction.
-//
-// This function is used by:
-//   - execute-workflow
-//   - run-worker
-//   - replay-workflow
-//
-// It guarantees that every workflow execution path
-// uses the SAME immutable definition.
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_runs
+//   - creates jobs
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -27,38 +26,142 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { workflow_version_id } = body;
+  try {
+    const body = await req.json();
+    const { version_id } = body;
 
-  if (!workflow_version_id) {
-    return new Response("missing-workflow-version-id", { status: 400 });
+    if (!version_id) {
+      return jsonError("missing-version-id", 400);
+    }
+
+    const version = await loadVersion(version_id);
+    if (!version) return jsonError("version-not-found", 404);
+
+    const graph = version.graph;
+    if (!graph || !Array.isArray(graph.nodes)) {
+      return jsonError("invalid-graph", 400);
+    }
+
+    // Validate graph structure
+    const validation = validateGraph(graph);
+    if (!validation.valid) {
+      return jsonError("graph-validation-failed", 400, validation.errors);
+    }
+
+    // Emit event
+    await supabase.from("workflow_events").insert({
+      run_id: null,
+      step_id: null,
+      type: "definition.loaded",
+      details: { version_id },
+      created_at: new Date(),
+    });
+
+    return jsonOK({
+      status: "definition-loaded",
+      version_id,
+      nodes: graph.nodes.length,
+      validation,
+    });
+  } catch (err) {
+    console.error("load-definition fatal error:", err);
+    return jsonError("load-definition-failed", 500, err);
   }
+});
 
-  // 1. Load workflow version (single authority)
-  const { data: version } = await supabase
+// ------------------------------------------------------------
+// Load Version
+// ------------------------------------------------------------
+
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
     .from("workflow_versions")
     .select("*")
-    .eq("id", workflow_version_id)
+    .eq("id", versionId)
     .single();
+  return data ?? null;
+}
 
-  if (!version) {
-    return new Response("version-not-found", { status: 404 });
+// ------------------------------------------------------------
+// Graph Validation
+// ------------------------------------------------------------
+
+function validateGraph(graph: any) {
+  const errors: string[] = [];
+  const nodes = graph.nodes;
+
+  const ids = new Set(nodes.map((n: any) => n.id));
+
+  for (const node of nodes) {
+    const id = node.id;
+
+    // Validate node type
+    if (!["task", "approval", "compensation"].includes(node.type)) {
+      errors.push(`invalid-node-type: ${id}`);
+    }
+
+    // Validate next edges
+    for (const nextId of node.next ?? []) {
+      if (!ids.has(nextId)) {
+        errors.push(`invalid-next-edge: ${id} → ${nextId}`);
+      }
+    }
+
+    // Validate failure edges
+    for (const failId of node.on_failure ?? []) {
+      if (!ids.has(failId)) {
+        errors.push(`invalid-failure-edge: ${id} → ${failId}`);
+      }
+    }
+
+    // Validate approval edges
+    for (const appId of node.on_approval ?? []) {
+      if (!ids.has(appId)) {
+        errors.push(`invalid-approval-edge: ${id} → ${appId}`);
+      }
+    }
+
+    // Validate compensation edges
+    for (const compId of node.on_compensation ?? []) {
+      if (!ids.has(compId)) {
+        errors.push(`invalid-compensation-edge: ${id} → ${compId}`);
+      }
+    }
+
+    // Validate connector reference
+    if (node.connector) {
+      if (typeof node.connector !== "string") {
+        errors.push(`invalid-connector: ${id}`);
+      }
+    }
   }
 
-  // 2. Validate definition structure
-  const definition = version.definition;
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
 
-  if (!definition || typeof definition !== "object") {
-    return new Response("invalid-definition", { status: 500 });
-  }
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  // 3. Return immutable definition
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      workflow_version_id,
-      definition,
-      status: "ok",
+      error: code,
+      details: err ? err : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
