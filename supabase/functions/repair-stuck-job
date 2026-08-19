@@ -1,5 +1,21 @@
-// supabase/functions/repair-stuck-jobs/index.ts
+// supabase/functions/repair-stuck-job/index.ts
 // Valtaris Glue — Stuck Job Repair Engine (Generation 3)
+//
+// This file is responsible for:
+//   - repairing jobs stuck in running/pending states
+//   - repairing jobs with expired leases
+//   - repairing jobs whose step-run is terminal
+//   - repairing jobs that have not progressed
+//   - emitting job repair events
+//
+// Authority chain:
+//   stuck-run-detector → repair-stuck-job → repair-run → job-lifecycle / step-lifecycle
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - creates jobs directly
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -9,118 +25,106 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const now = () => new Date();
-const nowIso = () => new Date().toISOString();
+const NOW = () => new Date();
+const NOW_ISO = () => new Date().toISOString();
 
-serve(async () => {
+const JOB_STUCK_MS = 1000 * 60 * 10; // 10 minutes
+
+serve(async (req) => {
   try {
-    await repairExpiredLeases();
-    await repairStuckRetrying();
-    await repairDelayedJobsWithExpiredApprovals();
+    const body = await req.json();
+    const { job_id } = body;
 
-    return jsonOK({ status: "job-repair-complete" });
+    if (!job_id) {
+      return jsonError("missing-job-id", 400);
+    }
+
+    const job = await loadJob(job_id);
+    if (!job) return jsonError("job-not-found", 404);
+
+    const steps = await loadStepRuns(job.run_id);
+
+    await detectExpiredLease(job);
+    await detectTerminalStep(job, steps);
+    await detectJobStuck(job);
+
+    return jsonOK({
+      status: "repair-stuck-job-complete",
+      job_id,
+      run_id: job.run_id,
+    });
   } catch (err) {
-    console.error("repair-stuck-jobs fatal:", err);
-    return jsonError("repair-failed", 500, err);
+    console.error("repair-stuck-job fatal error:", err);
+    return jsonError("repair-stuck-job-failed", 500, err);
   }
 });
 
 // ------------------------------------------------------------
-// Expired leases → fail job
+// Loaders
 // ------------------------------------------------------------
 
-async function repairExpiredLeases() {
-  const { data: jobs } = await supabase
+async function loadJob(jobId: string) {
+  const { data } = await supabase
     .from("workflow_jobs")
     .select("*")
-    .eq("state", "running")
-    .lt("lease_expires_at", nowIso());
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
+}
 
-  if (!jobs?.length) return;
+async function loadStepRuns(runId: string) {
+  const { data } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", runId);
+  return data ?? [];
+}
 
-  for (const job of jobs) {
-    await supabase.functions.invoke("job-lifecycle", {
-      body: {
-        job_id: job.id,
-        action: "fail",
-        error: "lease-expired",
-      },
+// ------------------------------------------------------------
+// Detection Logic
+// ------------------------------------------------------------
+
+async function detectExpiredLease(job: any) {
+  if (job.state === "running" && job.lease_expires_at < NOW_ISO()) {
+    await dispatchRepair("expired-lease", {
+      run_id: job.run_id,
+      job_id: job.id,
+    });
+  }
+}
+
+async function detectTerminalStep(job: any, steps: any[]) {
+  const step = steps.find((s) => s.step_id === job.step_id);
+  if (!step) return;
+
+  if (["completed", "failed", "compensated", "approved", "rejected"].includes(step.state)) {
+    await dispatchRepair("job-running-with-terminal-step", {
+      run_id: job.run_id,
+      job_id: job.id,
+    });
+  }
+}
+
+async function detectJobStuck(job: any) {
+  if (job.state !== "running") return;
+
+  const age = NOW().getTime() - new Date(job.started_at).getTime();
+  if (age > JOB_STUCK_MS) {
+    await dispatchRepair("job-running-without-progress", {
+      run_id: job.run_id,
+      job_id: job.id,
     });
   }
 }
 
 // ------------------------------------------------------------
-// Stuck retrying → backoff expired
+// Repair Dispatcher
 // ------------------------------------------------------------
 
-async function repairStuckRetrying() {
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("state", "retrying")
-    .lt("backoff_until", nowIso());
-
-  if (!jobs?.length) return;
-
-  for (const job of jobs) {
-    await supabase
-      .from("workflow_jobs")
-      .update({
-        state: "pending",
-        scheduled_at: null,
-      })
-      .eq("id", job.id);
-  }
-}
-
-// ------------------------------------------------------------
-// Delayed jobs with expired approvals → dead-letter
-// ------------------------------------------------------------
-
-async function repairDelayedJobsWithExpiredApprovals() {
-  const { data: approvals } = await supabase
-    .from("workflow_approvals")
-    .select("*")
-    .eq("state", "pending")
-    .lt("expires_at", nowIso());
-
-  if (!approvals?.length) return;
-
-  for (const approval of approvals) {
-    await supabase
-      .from("workflow_approvals")
-      .update({
-        state: "expired",
-        expired_at: now(),
-      })
-      .eq("id", approval.id);
-
-    const jobId = await findJobId(approval.run_id, approval.step_id);
-
-    if (jobId) {
-      await supabase.functions.invoke("dead-letter", {
-        body: {
-          job_id: jobId,
-          error: "approval-expired",
-        },
-      });
-    }
-  }
-}
-
-// ------------------------------------------------------------
-// Helper
-// ------------------------------------------------------------
-
-async function findJobId(runId: string, stepId: string) {
-  const { data } = await supabase
-    .from("workflow_jobs")
-    .select("id")
-    .eq("run_id", runId)
-    .eq("step_id", stepId)
-    .single();
-
-  return data?.id ?? null;
+async function dispatchRepair(type: string, payload: any) {
+  await supabase.functions.invoke("repair-run", {
+    body: { type, ...payload },
+  });
 }
 
 // ------------------------------------------------------------
@@ -134,11 +138,11 @@ function jsonOK(obj: any) {
   });
 }
 
-function jsonError(code: string, status = 500, err?: any) {
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
       error: code,
-      details: err ? String(err) : undefined,
+      details,
     }),
     {
       status,
