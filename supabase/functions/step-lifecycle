@@ -1,21 +1,22 @@
 // supabase/functions/step-lifecycle/index.ts
-// Valtaris Glue — Unified Step Lifecycle Engine
+// Valtaris Glue — Step Lifecycle Engine (Generation 3)
 //
-// This file centralizes ALL step lifecycle transitions.
-// It ensures steps move through deterministic, safe states:
-//
-//   pending → running → completed
-//   pending → running → failed → dead_letter
-//   pending → running → failed → compensating
-//
-// It prevents:
-//   - stuck steps
-//   - invalid transitions
-//   - partial updates
-//   - inconsistent state
+// This file is responsible for:
+//   - marking steps completed
+//   - marking steps failed
+//   - marking steps approved / rejected
+//   - marking steps compensated
+//   - emitting lifecycle events
+//   - triggering downstream scheduling
 //
 // Authority chain:
-//   job-lifecycle → step-lifecycle → workflow_step_runs
+//   run-worker → step-lifecycle → schedule-next-job
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - creates jobs directly
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -26,136 +27,183 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id, step_id, action, error } = body;
+  try {
+    const body = await req.json();
+    const { run_id, step_id, action, result, error } = body;
 
-  if (!run_id || !step_id || !action) {
-    return new Response("missing-required-fields", { status: 400 });
-  }
+    if (!run_id || !step_id || !action) {
+      return jsonError("missing-fields", 400);
+    }
 
-  // 1. Load step run
-  const { data: stepRun } = await supabase
-    .from("workflow_step_runs")
-    .select("*")
-    .eq("run_id", run_id)
-    .eq("step_id", step_id)
-    .single();
+    const run = await loadRun(run_id);
+    if (!run) return jsonError("run-not-found", 404);
 
-  if (!stepRun) {
-    return new Response("step-run-not-found", { status: 404 });
-  }
+    const version = await loadVersion(run.workflow_version_id);
+    if (!version) return jsonError("version-not-found", 404);
 
-  // 2. Determine lifecycle transition
-  switch (action) {
-    case "start":
-      return await startStep(stepRun);
+    const node = version.graph.nodes.find((n: any) => n.id === step_id);
+    if (!node) return jsonError("step-not-in-graph", 404);
 
-    case "complete":
-      return await completeStep(stepRun);
+    // Apply lifecycle action
+    switch (action) {
+      case "complete":
+        await markCompleted(run_id, step_id, result);
+        break;
 
-    case "fail":
-      return await failStep(stepRun, error);
+      case "fail":
+        await markFailed(run_id, step_id, error);
+        break;
 
-    case "dead_letter":
-      return await deadLetterStep(stepRun, error);
+      case "approve":
+        await markApproved(run_id, step_id);
+        break;
 
-    case "compensate":
-      return await compensateStep(stepRun);
+      case "reject":
+        await markRejected(run_id, step_id);
+        break;
 
-    default:
-      return new Response("invalid-action", { status: 400 });
+      case "compensate":
+        await markCompensated(run_id, step_id, result);
+        break;
+
+      default:
+        return jsonError("invalid-action", 400);
+    }
+
+    // Trigger downstream scheduling
+    await supabase.functions.invoke("schedule-next-job", {
+      body: { run_id },
+    });
+
+    return jsonOK({
+      status: "step-updated",
+      run_id,
+      step_id,
+      action,
+    });
+  } catch (err) {
+    console.error("step-lifecycle fatal error:", err);
+    return jsonError("step-lifecycle-failed", 500, err);
   }
 });
 
-// ----------------------------
-// Lifecycle Transitions
-// ----------------------------
+// ------------------------------------------------------------
+// Load Run + Version
+// ------------------------------------------------------------
 
-async function startStep(stepRun: any) {
-  if (stepRun.state !== "pending") {
-    return new Response("invalid-transition", { status: 400 });
-  }
-
-  await supabase
-    .from("workflow_step_runs")
-    .update({
-      state: "running",
-      started_at: new Date().toISOString(),
-    })
-    .eq("id", stepRun.id);
-
-  return new Response(
-    JSON.stringify({ step_id: stepRun.step_id, state: "running" }),
-    { status: 200 }
-  );
+async function loadRun(runId: string) {
+  const { data } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", runId)
+    .single();
+  return data ?? null;
 }
 
-async function completeStep(stepRun: any) {
-  if (stepRun.state !== "running") {
-    return new Response("invalid-transition", { status: 400 });
-  }
-
-  await supabase
-    .from("workflow_step_runs")
-    .update({
-      state: "completed",
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", stepRun.id);
-
-  return new Response(
-    JSON.stringify({ step_id: stepRun.step_id, state: "completed" }),
-    { status: 200 }
-  );
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", versionId)
+    .single();
+  return data ?? null;
 }
 
-async function failStep(stepRun: any, error: string) {
-  if (stepRun.state !== "running") {
-    return new Response("invalid-transition", { status: 400 });
-  }
+// ------------------------------------------------------------
+// Lifecycle Actions
+// ------------------------------------------------------------
 
-  await supabase
-    .from("workflow_step_runs")
-    .update({
-      state: "failed",
-      error,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", stepRun.id);
+async function markCompleted(run_id: string, step_id: string, result: any) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "completed",
+    result,
+    created_at: new Date(),
+  });
 
-  return new Response(
-    JSON.stringify({ step_id: stepRun.step_id, state: "failed", error }),
-    { status: 200 }
-  );
+  await emitEvent(run_id, step_id, "step.completed");
 }
 
-async function deadLetterStep(stepRun: any, error: string) {
-  await supabase
-    .from("workflow_step_runs")
-    .update({
-      state: "dead_letter",
-      error,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", stepRun.id);
+async function markFailed(run_id: string, step_id: string, error: any) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "failed",
+    error,
+    created_at: new Date(),
+  });
 
-  return new Response(
-    JSON.stringify({ step_id: stepRun.step_id, state: "dead_letter", error }),
-    { status: 200 }
-  );
+  await emitEvent(run_id, step_id, "step.failed");
 }
 
-async function compensateStep(stepRun: any) {
-  await supabase
-    .from("workflow_step_runs")
-    .update({
-      state: "compensating",
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", stepRun.id);
+async function markApproved(run_id: string, step_id: string) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "approved",
+    created_at: new Date(),
+  });
 
+  await emitEvent(run_id, step_id, "step.approved");
+}
+
+async function markRejected(run_id: string, step_id: string) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "rejected",
+    created_at: new Date(),
+  });
+
+  await emitEvent(run_id, step_id, "step.rejected");
+}
+
+async function markCompensated(run_id: string, step_id: string, result: any) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "compensated",
+    result,
+    created_at: new Date(),
+  });
+
+  await emitEvent(run_id, step_id, "step.compensated");
+}
+
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
+
+async function emitEvent(run_id: string, step_id: string, type: string) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id,
+    type,
+    created_at: new Date(),
+  });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
-    JSON.stringify({ step_id: stepRun.step_id, state: "compensating" }),
-    { status: 200 }
+    JSON.stringify({
+      error: code,
+      details,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
 }
