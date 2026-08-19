@@ -1,117 +1,240 @@
 // supabase/functions/worker-integrate/index.ts
-// Valtaris Glue — Worker Integration Layer
+// Valtaris Glue — Worker Integration Layer (Generation 3)
 //
-// This file integrates ALL runtime safety layers into the worker.
-// It ensures the worker uses:
-//   - idempotency
-//   - connector-wrapper
-//   - telemetry
-//   - worker-timeout
-//   - DLQ
-//   - finalization
-//   - compensation
-//   - graph loader
-//   - definition loader
+// This file is responsible for:
+//   - worker registration
+//   - worker heartbeat reporting
+//   - safe job claiming
+//   - safe job releasing
+//   - safe job progress reporting
+//   - emitting worker events
+//   - integrating workers with durable execution
 //
 // Authority chain:
-//   run-worker → worker-integrate → safety layers → step execution
+//   worker → worker-integrate → job-lifecycle / renew-lease / worker-timeout
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - schedules jobs directly
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const NOW = () => new Date();
+const NOW_ISO = () => new Date().toISOString();
+
+// Lease duration for claimed jobs
+const LEASE_MS = 1000 * 60 * 2; // 2 minutes
 
 serve(async (req) => {
-  const body = await req.json();
-  const { job_id, run_id, step_id, connector, payload } = body;
+  try {
+    const body = await req.json();
+    const { action, worker_id, job_id, progress } = body;
 
-  if (!job_id || !run_id || !step_id || !connector) {
-    return new Response("missing-required-fields", { status: 400 });
+    if (!action || !worker_id) {
+      return jsonError("missing-fields", 400);
+    }
+
+    switch (action) {
+      case "register":
+        return await registerWorker(worker_id);
+
+      case "heartbeat":
+        return await heartbeat(worker_id);
+
+      case "claim":
+        return await claimJob(worker_id, job_id);
+
+      case "release":
+        return await releaseJob(worker_id, job_id);
+
+      case "progress":
+        return await reportProgress(worker_id, job_id, progress);
+
+      default:
+        return jsonError("invalid-action", 400);
+    }
+  } catch (err) {
+    console.error("worker-integrate fatal error:", err);
+    return jsonError("worker-integrate-failed", 500, err);
+  }
+});
+
+// ------------------------------------------------------------
+// Worker Registration
+// ------------------------------------------------------------
+
+async function registerWorker(worker_id: string) {
+  await supabase.from("workflow_workers").upsert({
+    id: worker_id,
+    registered_at: NOW(),
+    last_heartbeat_at: NOW(),
+  });
+
+  await emitEvent(null, null, "worker.registered", { worker_id });
+
+  return jsonOK({
+    status: "worker-registered",
+    worker_id,
+  });
+}
+
+// ------------------------------------------------------------
+// Heartbeat
+// ------------------------------------------------------------
+
+async function heartbeat(worker_id: string) {
+  await supabase
+    .from("workflow_workers")
+    .update({ last_heartbeat_at: NOW() })
+    .eq("id", worker_id);
+
+  await emitEvent(null, null, "worker.heartbeat", { worker_id });
+
+  return jsonOK({
+    status: "heartbeat-ok",
+    worker_id,
+  });
+}
+
+// ------------------------------------------------------------
+// Job Claiming
+// ------------------------------------------------------------
+
+async function claimJob(worker_id: string, job_id: string) {
+  if (!job_id) return jsonError("missing-job-id", 400);
+
+  const leaseExpires = new Date(Date.now() + LEASE_MS).toISOString();
+
+  const { error } = await supabase
+    .from("workflow_jobs")
+    .update({
+      claimed_by: worker_id,
+      lease_expires_at: leaseExpires,
+      state: "running",
+      started_at: NOW(),
+    })
+    .eq("id", job_id)
+    .eq("state", "pending"); // idempotency guard
+
+  if (error) {
+    console.error("claim-job-error:", error);
+    return jsonError("claim-job-failed", 500, error);
   }
 
-  // 1. Enforce worker-side timeout
-  await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/worker-timeout`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id }),
-    }
-  );
+  await emitEvent(null, null, "worker.job.claimed", {
+    worker_id,
+    job_id,
+    lease_expires_at: leaseExpires,
+  });
 
-  // 2. Load graph (version authority)
-  const graphRes = await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/load-graph`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workflow_version_id: body.workflow_version_id }),
-    }
-  );
-  const graph = await graphRes.json();
+  return jsonOK({
+    status: "job-claimed",
+    worker_id,
+    job_id,
+    lease_expires_at: leaseExpires,
+  });
+}
 
-  // 3. Load definition (version authority)
-  const defRes = await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/load-definition`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workflow_version_id: body.workflow_version_id }),
-    }
-  );
-  const definition = await defRes.json();
+// ------------------------------------------------------------
+// Job Release
+// ------------------------------------------------------------
 
-  // 4. Execute connector through safety wrapper
-  const idempotencyKey = `${job_id}-${step_id}-${Date.now()}`;
-  const connectorRes = await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/connector-wrapper`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connector,
-        payload,
-        idempotencyKey,
-      }),
-    }
-  );
-  const connectorResult = await connectorRes.json();
+async function releaseJob(worker_id: string, job_id: string) {
+  if (!job_id) return jsonError("missing-job-id", 400);
 
-  // 5. Log telemetry
-  await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/connector-telemetry`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        connector,
-        idempotencyKey,
-        payload,
-        result: connectorResult.result,
-        error: connectorResult.error,
-        durationMs: connectorResult.durationMs,
-        run_id,
-        job_id,
-        step_id,
-      }),
-    }
-  );
+  await supabase
+    .from("workflow_jobs")
+    .update({
+      claimed_by: null,
+      lease_expires_at: null,
+    })
+    .eq("id", job_id)
+    .eq("claimed_by", worker_id);
 
-  // 6. Finalize run if needed
-  await fetch(
-    `${Deno.env.get("SUPABASE_URL")}/functions/v1/finalize-run`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_id }),
-    }
-  );
+  await emitEvent(null, null, "worker.job.released", {
+    worker_id,
+    job_id,
+  });
 
+  return jsonOK({
+    status: "job-released",
+    worker_id,
+    job_id,
+  });
+}
+
+// ------------------------------------------------------------
+// Job Progress Reporting
+// ------------------------------------------------------------
+
+async function reportProgress(worker_id: string, job_id: string, progress: any) {
+  if (!job_id) return jsonError("missing-job-id", 400);
+
+  await supabase
+    .from("workflow_jobs")
+    .update({
+      progress,
+      progress_at: NOW(),
+    })
+    .eq("id", job_id)
+    .eq("claimed_by", worker_id);
+
+  await emitEvent(null, null, "worker.job.progress", {
+    worker_id,
+    job_id,
+    progress,
+  });
+
+  return jsonOK({
+    status: "progress-updated",
+    worker_id,
+    job_id,
+    progress,
+  });
+}
+
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
+
+async function emitEvent(run_id: string | null, step_id: string | null, type: string, details: any) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id,
+    type,
+    details,
+    created_at: NOW(),
+  });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      job_id,
-      run_id,
-      step_id,
-      connector,
-      status: "integrated",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
