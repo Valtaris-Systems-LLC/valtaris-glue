@@ -1,21 +1,5 @@
 // supabase/functions/repair-stuck-run/index.ts
-// Valtaris Glue — Stuck Run Repair Engine (Generation 2)
-//
-// Responsibilities:
-//   - Detect workflow runs stuck in "running" state
-//   - Detect orphaned jobs (no pending/running jobs left)
-//   - Detect missing downstream jobs
-//   - Detect runs with expired job leases
-//   - Detect runs whose DAG progression halted
-//   - Repair run state safely
-//   - Trigger compensation if required
-//   - Mark run as failed or completed when appropriate
-//
-// Contract:
-//   - Does NOT execute connectors
-//   - Must be idempotent
-//   - Must preserve provenance
-//   - Called by scheduler, SLA sweeper, or manually
+// Valtaris Glue — Stuck Run Repair Engine (Generation 3)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -25,167 +9,180 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const RUN_STUCK_MS = 10 * 60 * 1000; // 10 minutes
+const now = () => new Date();
+const nowIso = () => new Date().toISOString();
 
-serve(async (req) => {
-  const body = await req.json().catch(() => ({}));
-  const { run_id } = body;
+serve(async () => {
+  try {
+    await repairExpiredLeases();
+    await repairStuckRetrying();
+    await repairExpiredApprovals();
+    await repairRunsWithNoActiveJobs();
 
-  if (!run_id) {
-    return new Response("missing-run-id", { status: 400 });
+    return jsonOK({ status: "repair-complete" });
+  } catch (err) {
+    console.error("repair-stuck-run fatal:", err);
+    return jsonError("repair-failed", 500, err);
   }
+});
 
-  // 1. Load run
-  const { data: runData, error: runError } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", run_id)
-    .single();
+// ------------------------------------------------------------
+// Expired leases → fail job
+// ------------------------------------------------------------
 
-  if (runError || !runData) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  const run = runData;
-
-  // Only repair runs stuck in "running"
-  if (run.state !== "running") {
-    return new Response(
-      JSON.stringify({
-        status: "run-not-stuck",
-        run_id,
-        state: run.state,
-      }),
-      { status: 200 }
-    );
-  }
-
-  const now = Date.now();
-  const runAge = now - new Date(run.created_at).getTime();
-  const runIsOld = runAge > RUN_STUCK_MS;
-
-  // 2. Load jobs for this run
-  const { data: jobsData, error: jobsError } = await supabase
+async function repairExpiredLeases() {
+  const { data: jobs } = await supabase
     .from("workflow_jobs")
     .select("*")
-    .eq("run_id", run_id);
+    .eq("state", "running")
+    .lt("lease_expires_at", nowIso());
 
-  if (jobsError || !jobsData) {
-    return new Response("run-jobs-not-found", { status: 404 });
-  }
+  if (!jobs?.length) return;
 
-  const jobs = jobsData;
-
-  const pending = jobs.filter((j) => j.state === "pending");
-  const running = jobs.filter((j) => j.state === "running");
-  const failed = jobs.filter((j) => j.state === "failed");
-  const completed = jobs.filter((j) => j.state === "completed");
-
-  // 3. Detect orphaned runs (no pending/running jobs left)
-  const noExecutableJobs = pending.length === 0 && running.length === 0;
-
-  // 4. Detect expired leases
-  const expiredLeases = running.filter(
-    (j) =>
-      j.lease_expires_at &&
-      new Date(j.lease_expires_at).getTime() < now
-  );
-
-  // 5. Detect missing downstream jobs
-  const missingDownstream =
-    completed.length > 0 && pending.length === 0 && running.length === 0;
-
-  // 6. Decide repair action
-  let action = "none";
-
-  if (expiredLeases.length > 0) {
-    action = "reset-expired-jobs";
-  } else if (noExecutableJobs && failed.length > 0) {
-    action = "mark-run-failed";
-  } else if (noExecutableJobs && completed.length > 0) {
-    action = "mark-run-completed";
-  } else if (missingDownstream) {
-    action = "trigger-compensation";
-  } else if (runIsOld) {
-    action = "mark-run-failed-timeout";
-  }
-
-  // 7. Execute repair action
-  if (action === "reset-expired-jobs") {
-    for (const job of expiredLeases) {
-      await supabase
-        .from("workflow_jobs")
-        .update({
-          state: "pending",
-          claimed_at: null,
-          lease_expires_at: null,
-          error: null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", job.id);
-    }
-  }
-
-  if (action === "mark-run-failed") {
-    await supabase
-      .from("workflow_runs")
-      .update({
-        state: "failed",
-        completed_at: new Date().toISOString(),
-      })
-      .eq("id", run_id);
-  }
-
-  if (action === "mark-run-completed") {
-    await supabase
-      .from("workflow_runs")
-      .update({
-        state: "completed",
-        completed_at: new Date().toISOString(),
-      })
-      .eq("id", run_id);
-  }
-
-  if (action === "trigger-compensation") {
-    await supabase.functions.invoke("compensate-step", {
+  for (const job of jobs) {
+    await supabase.functions.invoke("job-lifecycle", {
       body: {
-        run_id,
-        step_id: null,
-        payload: {},
+        job_id: job.id,
+        action: "fail",
+        error: "lease-expired",
       },
     });
   }
+}
 
-  if (action === "mark-run-failed-timeout") {
+// ------------------------------------------------------------
+// Stuck retrying → backoff expired
+// ------------------------------------------------------------
+
+async function repairStuckRetrying() {
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("state", "retrying")
+    .lt("backoff_until", nowIso());
+
+  if (!jobs?.length) return;
+
+  for (const job of jobs) {
     await supabase
-      .from("workflow_runs")
+      .from("workflow_jobs")
       .update({
-        state: "failed",
-        completed_at: new Date().toISOString(),
+        state: "pending",
+        scheduled_at: null,
       })
-      .eq("id", run_id);
+      .eq("id", job.id);
   }
+}
 
-  // 8. Record provenance
-  await supabase.from("workflow_run_repair").insert({
-    run_id,
-    action,
-    repaired_at: new Date().toISOString(),
-    metadata: {
-      expired_leases: expiredLeases.map((j) => j.id),
-      pending_count: pending.length,
-      running_count: running.length,
-      failed_count: failed.length,
-      completed_count: completed.length,
-    },
-  }).catch(() => {});
+// ------------------------------------------------------------
+// Expired approvals → dead-letter job
+// ------------------------------------------------------------
 
+async function repairExpiredApprovals() {
+  const { data: approvals } = await supabase
+    .from("workflow_approvals")
+    .select("*")
+    .eq("state", "pending")
+    .lt("expires_at", nowIso());
+
+  if (!approvals?.length) return;
+
+  for (const approval of approvals) {
+    await supabase
+      .from("workflow_approvals")
+      .update({
+        state: "expired",
+        expired_at: now(),
+      })
+      .eq("id", approval.id);
+
+    const jobId = await findJobId(approval.run_id, approval.step_id);
+
+    if (jobId) {
+      await supabase.functions.invoke("dead-letter", {
+        body: {
+          job_id: jobId,
+          error: "approval-expired",
+        },
+      });
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// Runs with no active jobs → mark failed
+// ------------------------------------------------------------
+
+async function repairRunsWithNoActiveJobs() {
+  const { data: runs } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("state", "running");
+
+  if (!runs?.length) return;
+
+  for (const run of runs) {
+    const { data: active } = await supabase
+      .from("workflow_jobs")
+      .select("id")
+      .eq("run_id", run.id)
+      .in("state", ["pending", "running", "retrying", "delayed"]);
+
+    if (!active?.length) {
+      await supabase
+        .from("workflow_runs")
+        .update({
+          state: "failed",
+          completed_at: now(),
+        })
+        .eq("id", run.id);
+
+      await supabase.from("workflow_incidents").insert({
+        run_id: run.id,
+        step_id: null,
+        type: "run.stuck",
+        error: "no-active-jobs",
+        created_at: now(),
+      });
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// Helper
+// ------------------------------------------------------------
+
+async function findJobId(runId: string, stepId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("id")
+    .eq("run_id", runId)
+    .eq("step_id", stepId)
+    .single();
+
+  return data?.id ?? null;
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      status: "run-repaired",
-      run_id,
-      action,
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
