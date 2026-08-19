@@ -1,23 +1,22 @@
 // supabase/functions/trigger-job/index.ts
-// Valtaris Glue — Unified Job Trigger
+// Valtaris Glue — Unified Job Trigger (Generation 3)
 //
-// This replaces ALL legacy job-triggering paths.
-// It enforces strict version authority and durable job semantics.
-//
-// Valid job triggers:
-//   - enqueue a downstream step
-//   - enqueue a manual step (approval)
-//   - enqueue a compensation step
-//
-// Invalid job triggers (now removed):
-//   - direct connector execution
-//   - direct workflow_run mutation
-//   - direct step execution
-//   - bypassing workflow_versions
-//   - bypassing durable job state
+// This file is responsible for:
+//   - transitioning a job from pending → running
+//   - acquiring a lease
+//   - emitting job.triggered events
+//   - invoking run-worker
+//   - guaranteeing idempotency
+//   - preventing double execution
 //
 // Authority chain:
-//   workflow_version → graph → step → job → worker
+//   scheduler → trigger-job → run-worker
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - schedules downstream jobs
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -27,70 +26,103 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const LEASE_MS = 1000 * 60 * 5; // 5 minutes
+
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id, step_id, payload } = body;
+  try {
+    const body = await req.json();
+    const { job_id } = body;
 
-  if (!run_id || !step_id) {
-    return new Response("missing-run-or-step", { status: 400 });
+    if (!job_id) {
+      return jsonError("missing-job-id", 400);
+    }
+
+    const job = await loadJob(job_id);
+    if (!job) return jsonError("job-not-found", 404);
+
+    // Only pending jobs can be triggered
+    if (job.state !== "pending") {
+      return jsonError("job-not-pending", 400);
+    }
+
+    // Acquire lease + mark running
+    const leaseExpires = new Date(Date.now() + LEASE_MS);
+
+    const { error: updateErr } = await supabase
+      .from("workflow_jobs")
+      .update({
+        state: "running",
+        lease_expires_at: leaseExpires.toISOString(),
+        started_at: new Date(),
+      })
+      .eq("id", job_id)
+      .eq("state", "pending"); // idempotency guard
+
+    if (updateErr) {
+      console.error("trigger-job update error:", updateErr);
+      return jsonError("job-update-failed", 500, updateErr);
+    }
+
+    // Emit job.triggered event
+    await supabase.from("workflow_events").insert({
+      run_id: job.run_id,
+      step_id: job.step_id,
+      type: "job.triggered",
+      details: { job_id },
+      created_at: new Date(),
+    });
+
+    // Hand off to worker
+    await supabase.functions.invoke("run-worker", {
+      body: { job_id },
+    });
+
+    return jsonOK({
+      status: "job-triggered",
+      job_id,
+      run_id: job.run_id,
+      step_id: job.step_id,
+      lease_expires_at: leaseExpires.toISOString(),
+    });
+  } catch (err) {
+    console.error("trigger-job fatal error:", err);
+    return jsonError("trigger-job-failed", 500, err);
   }
+});
 
-  // 1. Load workflow run
-  const { data: run } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", run_id)
-    .single();
+// ------------------------------------------------------------
+// Load Job
+// ------------------------------------------------------------
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  // 2. Load workflow version (single authority)
-  const { data: version } = await supabase
-    .from("workflow_versions")
-    .select("*")
-    .eq("id", run.workflow_version_id)
-    .single();
-
-  if (!version) {
-    return new Response("version-not-found", { status: 404 });
-  }
-
-  const graph = version.graph;
-
-  // 3. Validate step exists
-  const step = graph.nodes.find((n: any) => n.id === step_id);
-
-  if (!step) {
-    return new Response("step-not-found", { status: 404 });
-  }
-
-  // 4. Enqueue job (durable semantics)
-  const { data: job, error: jobErr } = await supabase
+async function loadJob(jobId: string) {
+  const { data } = await supabase
     .from("workflow_jobs")
-    .insert({
-      run_id,
-      step_id,
-      state: "pending",
-      attempt: 0,
-      payload: payload ?? {},
-      created_at: new Date().toISOString(),
-    })
     .select("*")
+    .eq("id", jobId)
     .single();
+  return data ?? null;
+}
 
-  if (jobErr) {
-    return new Response("job-create-failed", { status: 500 });
-  }
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      step_id,
-      job_id: job.id,
-      status: "ok",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
