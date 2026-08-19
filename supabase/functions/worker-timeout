@@ -1,21 +1,21 @@
 // supabase/functions/worker-timeout/index.ts
-// Valtaris Glue — Worker-Side Timeout Enforcement
+// Valtaris Glue — Worker-Side Timeout Enforcement (Generation 3)
 //
-// This protects the ENTIRE step execution pipeline.
-// If the worker stalls or hangs, Glue must:
-//   - abort the step
-//   - fail the job
-//   - send to DLQ
-//   - finalize the run
-//
-// This prevents:
-//   - stuck jobs
-//   - stuck runs
-//   - partial execution
-//   - infinite hangs
+// This file is responsible for:
+//   - enforcing max execution time inside the worker
+//   - detecting jobs that exceed worker timeout
+//   - detecting step-runs that exceed worker timeout
+//   - force-failing jobs and steps that violate timeout
+//   - emitting worker-timeout events
 //
 // Authority chain:
-//   run-worker → worker-timeout → dead-letter → finalize-run
+//   run-worker → worker-timeout → job-lifecycle / step-lifecycle → schedule-next-job
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - schedules jobs directly
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -25,69 +25,140 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-// Worker timeout for entire step execution
-const WORKER_TIMEOUT_MS = 1000 * 30; // 30 seconds
+// Worker-side timeout (Generation‑3 standard)
+const WORKER_TIMEOUT_MS = 1000 * 60 * 10; // 10 minutes
+
+const NOW = () => new Date();
 
 serve(async (req) => {
-  const body = await req.json();
-  const { job_id } = body;
+  try {
+    const body = await req.json();
+    const { job_id } = body;
 
-  if (!job_id) {
-    return new Response("missing-job-id", { status: 400 });
-  }
+    if (!job_id) {
+      return jsonError("missing-job-id", 400);
+    }
 
-  // 1. Load job
-  const { data: job } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("id", job_id)
-    .single();
+    const job = await loadJob(job_id);
+    if (!job) return jsonError("job-not-found", 404);
 
-  if (!job) {
-    return new Response("job-not-found", { status: 404 });
-  }
+    const steps = await loadStepRuns(job.run_id);
 
-  // 2. Check if job exceeded worker timeout
-  const startedAt = new Date(job.claimed_at).getTime();
-  const now = Date.now();
+    // Check job timeout
+    await enforceJobTimeout(job);
 
-  if (now - startedAt < WORKER_TIMEOUT_MS) {
-    return new Response("job-within-timeout", { status: 200 });
-  }
+    // Check step timeout
+    await enforceStepTimeout(job, steps);
 
-  // 3. Mark job as failed due to timeout
-  await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "failed",
-      error: "worker-timeout",
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", job_id);
-
-  // 4. Insert DLQ entry
-  await supabase.from("workflow_dead_letters").insert({
-    run_id: job.run_id,
-    workflow_version_id: job.workflow_version_id,
-    step_id: job.step_id,
-    job_id: job.id,
-    attempt: job.attempt,
-    payload: job.payload,
-    error: "worker-timeout",
-    created_at: new Date().toISOString(),
-  });
-
-  // 5. Finalize run
-  await supabase.functions.invoke("finalize-run", {
-    body: { run_id: job.run_id },
-  });
-
-  return new Response(
-    JSON.stringify({
+    return jsonOK({
+      status: "worker-timeout-check-complete",
       job_id,
       run_id: job.run_id,
-      status: "worker-timeout",
-    }),
-    { status: 200 }
-  );
+    });
+  } catch (err) {
+    console.error("worker-timeout fatal error:", err);
+    return jsonError("worker-timeout-failed", 500, err);
+  }
 });
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadJob(jobId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
+}
+
+async function loadStepRuns(runId: string) {
+  const { data } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", runId);
+  return data ?? [];
+}
+
+// ------------------------------------------------------------
+// Enforcement Logic
+// ------------------------------------------------------------
+
+async function enforceJobTimeout(job: any) {
+  if (job.state !== "running") return;
+
+  const age = NOW().getTime() - new Date(job.started_at).getTime();
+
+  if (age > WORKER_TIMEOUT_MS) {
+    await emitTimeoutEvent(job.run_id, job.step_id, "job.timeout");
+
+    await supabase.functions.invoke("job-lifecycle", {
+      body: {
+        job_id: job.id,
+        action: "fail",
+        error: "worker-timeout",
+      },
+    });
+  }
+}
+
+async function enforceStepTimeout(job: any, steps: any[]) {
+  const step = steps.find((s) => s.step_id === job.step_id);
+  if (!step) return;
+
+  if (step.state !== "running") return;
+
+  const age = NOW().getTime() - new Date(step.created_at).getTime();
+
+  if (age > WORKER_TIMEOUT_MS) {
+    await emitTimeoutEvent(job.run_id, job.step_id, "step.timeout");
+
+    await supabase.functions.invoke("step-lifecycle", {
+      body: {
+        run_id: job.run_id,
+        step_id: job.step_id,
+        action: "fail",
+        error: "worker-timeout",
+      },
+    });
+  }
+}
+
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
+
+async function emitTimeoutEvent(run_id: string, step_id: string, type: string) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id,
+    type,
+    created_at: NOW(),
+  });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
