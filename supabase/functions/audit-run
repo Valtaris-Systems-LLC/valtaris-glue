@@ -1,16 +1,23 @@
 // supabase/functions/audit-run/index.ts
-// Valtaris Glue — Run Consistency Auditor
+// Valtaris Glue — Workflow Run Consistency Audit (Generation 3)
 //
-// This file performs a deep audit of a workflow run.
-// It detects and repairs inconsistencies across:
-//   - workflow_runs
-//   - workflow_step_runs
-//   - workflow_jobs
-//   - workflow_dead_letters
-//   - workflow_idempotency
+// This file is responsible for:
+//   - validating workflow run consistency
+//   - validating step history correctness
+//   - validating job history correctness
+//   - validating DAG completeness
+//   - validating terminal state correctness
+//   - emitting audit events
+//   - producing a clean audit record for replay + observability
 //
 // Authority chain:
-//   audit-run → repair-engines → lifecycle-engines → finalization
+//   finalize-run → audit-run → replay-workflow (optional)
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -21,148 +28,186 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id } = body;
+  try {
+    const body = await req.json();
+    const { run_id } = body;
 
-  if (!run_id) {
-    return new Response("missing-run-id", { status: 400 });
+    if (!run_id) {
+      return jsonError("missing-run-id", 400);
+    }
+
+    const run = await loadRun(run_id);
+    if (!run) return jsonError("run-not-found", 404);
+
+    const version = await loadVersion(run.workflow_version_id);
+    if (!version) return jsonError("version-not-found", 404);
+
+    const steps = await loadStepRuns(run_id);
+    const jobs = await loadJobs(run_id);
+
+    const audit = {
+      run_id,
+      terminal_state: run.state,
+      step_count: steps.length,
+      job_count: jobs.length,
+      step_state_summary: summarizeStepStates(steps),
+      job_state_summary: summarizeJobStates(jobs),
+      dag_completeness: checkDagCompleteness(version, steps),
+      terminal_state_valid: checkTerminalState(run, steps),
+      created_at: new Date(),
+    };
+
+    // Emit audit event
+    await supabase.from("workflow_events").insert({
+      run_id,
+      step_id: null,
+      type: "run.audit",
+      details: audit,
+      created_at: new Date(),
+    });
+
+    // Store audit record
+    await supabase.from("workflow_run_audits").insert(audit);
+
+    return jsonOK({
+      status: "audit-complete",
+      audit,
+    });
+  } catch (err) {
+    console.error("audit-run fatal error:", err);
+    return jsonError("audit-run-failed", 500, err);
   }
+});
 
-  // 1. Load run
-  const { data: run } = await supabase
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadRun(runId: string) {
+  const { data } = await supabase
     .from("workflow_runs")
     .select("*")
-    .eq("id", run_id)
+    .eq("id", runId)
     .single();
+  return data ?? null;
+}
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  // 2. Load workflow version
-  const { data: version } = await supabase
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
     .from("workflow_versions")
     .select("*")
-    .eq("id", run.workflow_version_id)
+    .eq("id", versionId)
     .single();
+  return data ?? null;
+}
 
-  const graph = version.graph;
-
-  // 3. Load all related records
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("run_id", run_id);
-
-  const { data: steps } = await supabase
+async function loadStepRuns(runId: string) {
+  const { data } = await supabase
     .from("workflow_step_runs")
     .select("*")
-    .eq("run_id", run_id);
+    .eq("run_id", runId)
+    .order("created_at", { ascending: true });
+  return data ?? [];
+}
 
-  const { data: dlq } = await supabase
-    .from("workflow_dead_letters")
+async function loadJobs(runId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
     .select("*")
-    .eq("run_id", run_id);
+    .eq("run_id", runId);
+  return data ?? [];
+}
 
-  const { data: idem } = await supabase
-    .from("workflow_idempotency")
-    .select("*");
+// ------------------------------------------------------------
+// Summaries
+// ------------------------------------------------------------
 
-  const repairs = [];
-
-  // ----------------------------
-  // Check 1: Every step-run must match graph
-  // ----------------------------
-  for (const stepRun of steps) {
-    const node = graph.nodes.find((n: any) => n.id === stepRun.step_id);
-    if (!node) {
-      repairs.push(`step-run ${stepRun.step_id} invalid: not in graph`);
-      await supabase
-        .from("workflow_step_runs")
-        .update({ state: "dead_letter", error: "invalid-step" })
-        .eq("id", stepRun.id);
-    }
+function summarizeStepStates(steps: any[]) {
+  const summary: Record<string, number> = {};
+  for (const s of steps) {
+    summary[s.state] = (summary[s.state] ?? 0) + 1;
   }
+  return summary;
+}
 
-  // ----------------------------
-  // Check 2: Every job must match a step-run
-  // ----------------------------
-  for (const job of jobs) {
-    const stepRun = steps.find((s: any) => s.step_id === job.step_id);
-    if (!stepRun) {
-      repairs.push(`job ${job.id} missing step-run`);
-      await supabase.from("workflow_step_runs").insert({
-        run_id,
-        step_id: job.step_id,
-        state: "pending",
-        created_at: new Date().toISOString(),
-      });
-    }
+function summarizeJobStates(jobs: any[]) {
+  const summary: Record<string, number> = {};
+  for (const j of jobs) {
+    summary[j.state] = (summary[j.state] ?? 0) + 1;
   }
+  return summary;
+}
 
-  // ----------------------------
-  // Check 3: Every completed job must have idempotency result
-  // ----------------------------
-  for (const job of jobs) {
-    if (job.state === "completed") {
-      const key = `${job.id}-${job.step_id}`;
-      const entry = idem.find((i: any) => i.key === key);
-      if (!entry) {
-        repairs.push(`job ${job.id} missing idempotency result`);
-        await supabase
-          .from("workflow_jobs")
-          .update({ state: "failed", error: "missing-idempotency" })
-          .eq("id", job.id);
-      }
-    }
-  }
+// ------------------------------------------------------------
+// DAG Completeness Check
+// ------------------------------------------------------------
 
-  // ----------------------------
-  // Check 4: Every DLQ entry must match a failed job
-  // ----------------------------
-  for (const entry of dlq) {
-    const job = jobs.find((j: any) => j.id === entry.job_id);
-    if (!job || job.state !== "failed") {
-      repairs.push(`DLQ entry ${entry.id} inconsistent with job`);
-      await supabase
-        .from("workflow_dead_letters")
-        .update({ error: "inconsistent-dlq" })
-        .eq("id", entry.id);
-    }
-  }
-
-  // ----------------------------
-  // Check 5: Run terminal state correctness
-  // ----------------------------
-  const allTerminal = jobs.every((j: any) =>
-    ["completed", "failed", "dead_letter", "compensated"].includes(j.state)
+function checkDagCompleteness(version: any, steps: any[]) {
+  const completed = new Set(
+    steps.filter((s) => s.state === "completed").map((s) => s.step_id)
   );
 
-  if (run.state === "running" && allTerminal) {
-    repairs.push("run marked running but all jobs terminal");
-    await supabase.functions.invoke("finalize-run", {
-      body: { run_id },
-    });
+  const missing: string[] = [];
+
+  for (const node of version.graph.nodes) {
+    if (!completed.has(node.id)) {
+      missing.push(node.id);
+    }
   }
 
-  // ----------------------------
-  // Check 6: Non-terminal run must have runnable jobs
-  // ----------------------------
-  const hasRunnable = jobs.some((j: any) => j.state === "pending");
+  return {
+    total_nodes: version.graph.nodes.length,
+    completed_nodes: completed.size,
+    missing_nodes: missing,
+    complete: missing.length === 0,
+  };
+}
 
-  if (!allTerminal && !hasRunnable) {
-    repairs.push("run has no runnable jobs but is not terminal");
-    await supabase.functions.invoke("schedule-next-job", {
-      body: { run_id },
-    });
+// ------------------------------------------------------------
+// Terminal State Check
+// ------------------------------------------------------------
+
+function checkTerminalState(run: any, steps: any[]) {
+  const failed = steps.some((s) => s.state === "failed");
+  const completed = steps.every(
+    (s) => s.state === "completed" || s.state === "approved"
+  );
+
+  if (run.state === "completed") {
+    return completed;
   }
 
+  if (run.state === "failed") {
+    return failed;
+  }
+
+  if (run.state === "cancelled") {
+    return true;
+  }
+
+  return false;
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      repairs,
-      status: "audit-complete",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
