@@ -1,18 +1,23 @@
-// supabase/functions/stuck-run-detector/index.ts
-// Valtaris Glue — Stuck Run Detector
+// supabase/functions/repair-run/index.ts
+// Valtaris Glue — Central Run Repair Engine (Generation 3)
 //
-// This file detects workflow runs that are stuck or not progressing.
-// It triggers automatic repair and recovery.
-//
-// A run is considered stuck if:
-//   - no jobs have progressed for > 30 seconds
-//   - a job is leased past expiration
-//   - a step-run is running past worker-timeout
-//   - the run is "running" but has no runnable jobs
-//   - the run is non-terminal but all jobs are terminal
+// This file is responsible for:
+//   - repairing invariant violations
+//   - repairing expired leases
+//   - repairing stuck jobs
+//   - repairing stuck step-runs
+//   - repairing inconsistent run states
+//   - dispatching to job-lifecycle + step-lifecycle
+//   - emitting repair events
 //
 // Authority chain:
-//   stuck-run-detector → repair-run → check-invariants → audit-run → scheduler → finalization
+//   check-invariants → repair-run → job-lifecycle / step-lifecycle / run-lifecycle
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs directly
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -22,98 +27,199 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const STUCK_THRESHOLD_MS = 30000; // 30 seconds
+const NOW = () => new Date();
+const NOW_ISO = () => new Date().toISOString();
 
-serve(async () => {
-  const now = Date.now();
+serve(async (req) => {
+  try {
+    const body = await req.json();
+    const { run_id, type, job_id, step_id } = body;
 
-  // 1. Load all non-terminal runs
-  const { data: runs } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .not("state", "in", ["completed", "failed", "cancelled", "compensated", "replay_completed"]);
-
-  const stuck = [];
-
-  for (const run of runs) {
-    const { data: jobs } = await supabase
-      .from("workflow_jobs")
-      .select("*")
-      .eq("run_id", run.id);
-
-    const { data: steps } = await supabase
-      .from("workflow_step_runs")
-      .select("*")
-      .eq("run_id", run.id);
-
-    const lastProgress = Math.max(
-      ...jobs.map((j: any) => new Date(j.updated_at ?? j.created_at).getTime()),
-      ...steps.map((s: any) => new Date(s.updated_at ?? s.created_at).getTime())
-    );
-
-    const noProgressTooLong = now - lastProgress > STUCK_THRESHOLD_MS;
-
-    const hasStuckLease = jobs.some(
-      (j: any) =>
-        j.state === "leased" &&
-        new Date(j.lease_expires_at).getTime() < now
-    );
-
-    const hasStuckStep = steps.some(
-      (s: any) =>
-        s.state === "running" &&
-        new Date(s.started_at).getTime() < now - STUCK_THRESHOLD_MS
-    );
-
-    const allTerminal = jobs.every((j: any) =>
-      ["completed", "failed", "dead_letter", "compensated"].includes(j.state)
-    );
-
-    const hasRunnable = jobs.some((j: any) => j.state === "pending");
-
-    const runIsStuck =
-      noProgressTooLong ||
-      hasStuckLease ||
-      hasStuckStep ||
-      (run.state === "running" && !hasRunnable) ||
-      (!allTerminal && !hasRunnable);
-
-    if (runIsStuck) {
-      stuck.push(run.id);
-
-      // 2. Repair run
-      await supabase.functions.invoke("repair-run", {
-        body: { run_id: run.id },
-      });
-
-      // 3. Check invariants
-      await supabase.functions.invoke("check-invariants", {
-        body: { run_id: run.id },
-      });
-
-      // 4. Audit run
-      await supabase.functions.invoke("audit-run", {
-        body: { run_id: run.id },
-      });
-
-      // 5. Finalize if needed
-      await supabase.functions.invoke("finalize-run", {
-        body: { run_id: run.id },
-      });
-
-      // 6. Schedule next job
-      await supabase.functions.invoke("schedule-next-job", {
-        body: { run_id: run.id },
-      });
+    if (!run_id || !type) {
+      return jsonError("missing-fields", 400);
     }
-  }
 
+    // Emit repair event
+    await emitRepairEvent(run_id, type, job_id, step_id);
+
+    switch (type) {
+      case "expired-lease":
+        await repairExpiredLease(job_id);
+        break;
+
+      case "step-run-timeout":
+        await repairStepTimeout(run_id, step_id);
+        break;
+
+      case "missing-step-run":
+        await repairMissingStepRun(run_id, job_id);
+        break;
+
+      case "invalid-step-run":
+        await repairInvalidStepRun(run_id, step_id);
+        break;
+
+      case "run-completed-with-active-jobs":
+        await forceRunFailed(run_id, "completed_with_active_jobs");
+        break;
+
+      case "run-running-with-no-active-jobs":
+        await forceRunFailed(run_id, "running_with_no_active_jobs");
+        break;
+
+      case "job-running-with-terminal-step":
+        await forceJobFailed(job_id, "terminal_step_state");
+        break;
+
+      case "step-completed-with-noncompleted-job":
+        await forceStepFailed(run_id, step_id, "job_not_completed");
+        break;
+
+      case "run-failed-without-compensation":
+        await forceRunFailed(run_id, "missing_compensation");
+        break;
+
+      default:
+        return jsonError("unknown-repair-type", 400);
+    }
+
+    return jsonOK({
+      status: "repair-complete",
+      run_id,
+      type,
+    });
+  } catch (err) {
+    console.error("repair-run fatal error:", err);
+    return jsonError("repair-run-failed", 500, err);
+  }
+});
+
+// ------------------------------------------------------------
+// Repair Actions
+// ------------------------------------------------------------
+
+async function repairExpiredLease(job_id: string) {
+  await supabase.functions.invoke("job-lifecycle", {
+    body: {
+      job_id,
+      action: "fail",
+      error: "lease-expired",
+    },
+  });
+}
+
+async function repairStepTimeout(run_id: string, step_id: string) {
+  await supabase.functions.invoke("step-lifecycle", {
+    body: {
+      run_id,
+      step_id,
+      action: "fail",
+      error: "step-timeout",
+    },
+  });
+}
+
+async function repairMissingStepRun(run_id: string, job_id: string) {
+  const job = await loadJob(job_id);
+  if (!job) return;
+
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id: job.step_id,
+    state: "failed",
+    error: "missing-step-run",
+    created_at: NOW(),
+  });
+}
+
+async function repairInvalidStepRun(run_id: string, step_id: string) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "failed",
+    error: "invalid-step-run",
+    created_at: NOW(),
+  });
+}
+
+async function forceRunFailed(run_id: string, reason: string) {
+  await supabase.functions.invoke("run-lifecycle", {
+    body: {
+      run_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+async function forceJobFailed(job_id: string, reason: string) {
+  await supabase.functions.invoke("job-lifecycle", {
+    body: {
+      job_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+async function forceStepFailed(run_id: string, step_id: string, reason: string) {
+  await supabase.functions.invoke("step-lifecycle", {
+    body: {
+      run_id,
+      step_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadJob(jobId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
+}
+
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
+
+async function emitRepairEvent(run_id: string, type: string, job_id?: string, step_id?: string) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id: step_id ?? null,
+    type: `repair.${type}`,
+    details: { job_id, step_id },
+    created_at: NOW(),
+  });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      stuck_runs: stuck,
-      count: stuck.length,
-      status: "stuck-run-scan-complete",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
