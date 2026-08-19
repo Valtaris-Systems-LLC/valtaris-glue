@@ -1,30 +1,23 @@
 // supabase/functions/dead-letter/index.ts
-// Valtaris Glue — Dead-Letter Queue Handler
+// Valtaris Glue — Dead Letter Queue Handler (Generation 3)
 //
-// When a job exceeds max retries or encounters a fatal error,
-// it must be moved to the dead-letter queue (DLQ).
+// This file is responsible for:
+//   - marking jobs as dead_letter
+//   - recording workflow_dead_letter entries
+//   - recording workflow_incidents
+//   - recording workflow_step_runs (failed)
+//   - emitting workflow_events
+//   - preserving version-pinned execution semantics
 //
-// DLQ entries contain:
-//   - run_id
-//   - workflow_version_id
-//   - step_id
-//   - job_id
-//   - attempt
-//   - payload
-//   - error
-//   - timestamp
+// Authority chain:
+//   run-worker → job-lifecycle → dead-letter
 //
-// This prevents:
-//   - infinite retry loops
-//   - stuck runs
-//   - silent failures
-//   - inconsistent state
-//
-// DLQ is the foundation for:
-//   - compensation steps
-//   - audit trails
-//   - debugging
-//   - safe recovery
+// This file NEVER:
+//   - mutates workflow_versions
+//   - mutates workflow_runs directly
+//   - bypasses RLS
+//   - executes connectors
+//   - retries jobs
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -35,83 +28,118 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { job_id, error } = body;
+  try {
+    const body = await req.json();
+    const { job_id, error } = body;
 
-  if (!job_id || !error) {
-    return new Response("missing-job-or-error", { status: 400 });
+    if (!job_id) {
+      return jsonError("missing-job-id", 400);
+    }
+
+    const job = await loadJob(job_id);
+    if (!job) {
+      return jsonError("job-not-found", 404);
+    }
+
+    await markDeadLetter(job, error ?? "dead-letter");
+
+    return jsonOK({
+      status: "dead_letter",
+      job_id,
+      run_id: job.run_id,
+      step_id: job.step_id,
+    });
+  } catch (err) {
+    console.error("dead-letter fatal error:", err);
+    return jsonError("dead-letter-failed", 500, err);
   }
+});
 
-  // 1. Load job
-  const { data: job } = await supabase
+// ------------------------------------------------------------
+// Load Job
+// ------------------------------------------------------------
+
+async function loadJob(jobId: string) {
+  const { data } = await supabase
     .from("workflow_jobs")
     .select("*")
-    .eq("id", job_id)
+    .eq("id", jobId)
     .single();
+  return data ?? null;
+}
 
-  if (!job) {
-    return new Response("job-not-found", { status: 404 });
-  }
+// ------------------------------------------------------------
+// Mark Dead Letter
+// ------------------------------------------------------------
 
-  // 2. Load run
-  const { data: run } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", job.run_id)
-    .single();
-
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  // 3. Insert DLQ entry
-  const { error: dlqErr } = await supabase
-    .from("workflow_dead_letters")
-    .insert({
-      run_id: run.id,
-      workflow_version_id: run.workflow_version_id,
-      step_id: job.step_id,
-      job_id: job.id,
-      attempt: job.attempt,
-      payload: job.payload,
-      error,
-      created_at: new Date().toISOString(),
-    });
-
-  if (dlqErr) {
-    return new Response("dlq-insert-failed", { status: 500 });
-  }
-
-  // 4. Mark job as failed
+async function markDeadLetter(job: any, reason: string) {
+  // 1. Mark job as dead_letter
   await supabase
     .from("workflow_jobs")
     .update({
       state: "dead_letter",
-      completed_at: new Date().toISOString(),
-      error,
+      completed_at: new Date(),
     })
     .eq("id", job.id);
 
-  // 5. Mark run as failed (unless compensation is enabled)
-  const compensationEnabled = run.compensation_enabled ?? false;
+  // 2. Record step run
+  await supabase.from("workflow_step_runs").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    state: "failed",
+    error: reason,
+    created_at: new Date(),
+  });
 
-  if (!compensationEnabled) {
-    await supabase
-      .from("workflow_runs")
-      .update({
-        state: "failed",
-        completed_at: new Date().toISOString(),
-      })
-      .eq("id", run.id);
-  }
+  // 3. Record DLQ entry
+  await supabase.from("workflow_dead_letter").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    error: reason,
+    created_at: new Date(),
+  });
 
+  // 4. Record incident
+  await supabase.from("workflow_incidents").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "dead_letter",
+    error: reason,
+    created_at: new Date(),
+  });
+
+  // 5. Emit workflow event
+  await supabase.from("workflow_events").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "step.dead_letter",
+    error: reason,
+    created_at: new Date(),
+  });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      job_id,
-      run_id: run.id,
-      step_id: job.step_id,
-      status: "dead_letter",
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
