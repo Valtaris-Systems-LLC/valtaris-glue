@@ -1,112 +1,165 @@
 // supabase/functions/connector-registry/index.ts
-// Valtaris Glue — Connector Registry
+// Valtaris Glue — Connector Registry (Generation 3)
 //
-// This file defines the SINGLE authoritative registry of all connectors.
-// Every connector must be declared here.
-//
-// Registry entries include:
-//   - name
-//   - category
-//   - description
-//   - required payload fields
-//   - safety flags
-//
-// This enables:
-//   - validation
-//   - introspection
-//   - documentation
-//   - safety enforcement
-//   - consistent dispatch
+// This file is responsible for:
+//   - mapping connector names → adapter definitions
+//   - validating connector existence
+//   - returning adapter metadata to execute-step + connector-wrapper
+//   - isolating external systems behind adapters
 //
 // Authority chain:
-//   execute-step → connector-wrapper → connector-registry → connector
+//   run-worker → execute-step → connector-wrapper → adapter
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_runs
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - performs external calls
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 
-serve(async () => {
-  const registry = [
-    // ----------------------------
-    // HTTP Connectors
-    // ----------------------------
-    {
-      name: "http.get",
-      category: "http",
-      description: "Perform an HTTP GET request",
-      required: ["url"],
-      safe: true,
-    },
-    {
-      name: "http.post",
-      category: "http",
-      description: "Perform an HTTP POST request",
-      required: ["url", "body"],
-      safe: true,
-    },
-    {
-      name: "http.put",
-      category: "http",
-      description: "Perform an HTTP PUT request",
-      required: ["url", "body"],
-      safe: true,
-    },
-    {
-      name: "http.delete",
-      category: "http",
-      description: "Perform an HTTP DELETE request",
-      required: ["url"],
-      safe: true,
-    },
+// ------------------------------------------------------------
+// Adapter Registry
+// ------------------------------------------------------------
+//
+// Each adapter MUST expose:
+//   execute(args)
+//
+// The adapter receives:
+//   {
+//     run_id,
+//     step_id,
+//     job_id,
+//     node,
+//     payload,
+//     idempotencyKey
+//   }
+//
+// You can expand this registry as Glue grows.
 
-    // ----------------------------
-    // Supabase Connectors
-    // ----------------------------
-    {
-      name: "supabase.select",
-      category: "supabase",
-      description: "Select rows from a Supabase table",
-      required: ["table", "filters"],
-      safe: true,
-    },
-    {
-      name: "supabase.insert",
-      category: "supabase",
-      description: "Insert rows into a Supabase table",
-      required: ["table", "values"],
-      safe: true,
-    },
-    {
-      name: "supabase.update",
-      category: "supabase",
-      description: "Update rows in a Supabase table",
-      required: ["table", "filters", "values"],
-      safe: true,
-    },
-    {
-      name: "supabase.delete",
-      category: "supabase",
-      description: "Delete rows from a Supabase table",
-      required: ["table", "filters"],
-      safe: true,
-    },
+const adapters: Record<string, any> = {
+  "http.basic": {
+    execute: async ({ payload }) => {
+      const { url, method = "GET", body } = payload;
 
-    // ----------------------------
-    // AI Connectors
-    // ----------------------------
-    {
-      name: "ai.generate",
-      category: "ai",
-      description: "Generate text using an AI model",
-      required: ["prompt"],
-      safe: true,
-    },
-  ];
+      const res = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
 
+      const json = await safeJson(res);
+      return { status: res.status, data: json };
+    },
+  },
+
+  "supabase.basic": {
+    execute: async ({ payload }) => {
+      const url = Deno.env.get("SUPABASE_URL")!;
+      const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+      const client = createClient(url, key);
+
+      const { table, op, values, filters } = payload;
+
+      switch (op) {
+        case "select":
+          return await client.from(table).select("*").match(filters);
+        case "insert":
+          return await client.from(table).insert(values).select();
+        case "update":
+          return await client.from(table).update(values).match(filters).select();
+        case "delete":
+          return await client.from(table).delete().match(filters).select();
+        default:
+          throw new Error(`unknown-supabase-op: ${op}`);
+      }
+    },
+  },
+
+  "ai.openai": {
+    execute: async ({ payload }) => {
+      const apiKey = Deno.env.get("OPENAI_API_KEY")!;
+      const { prompt } = payload;
+
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+
+      const json = await safeJson(res);
+      return { status: res.status, data: json };
+    },
+  },
+};
+
+// ------------------------------------------------------------
+// Safe JSON Helper
+// ------------------------------------------------------------
+
+async function safeJson(res: Response) {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// Handler
+// ------------------------------------------------------------
+
+serve(async (req) => {
+  try {
+    const body = await req.json();
+    const { connector } = body;
+
+    if (!connector) {
+      return jsonError("missing-connector", 400);
+    }
+
+    const adapter = adapters[connector];
+    if (!adapter) {
+      return jsonError("unknown-connector", 404);
+    }
+
+    return jsonOK({
+      status: "adapter-found",
+      adapter,
+    });
+  } catch (err) {
+    console.error("connector-registry fatal error:", err);
+    return jsonError("connector-registry-failed", 500, err);
+  }
+});
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      connectors: registry,
-      count: registry.length,
-      status: "ok",
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
