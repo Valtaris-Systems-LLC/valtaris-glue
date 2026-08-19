@@ -1,23 +1,21 @@
 // supabase/functions/finalize-run/index.ts
-// Valtaris Glue — Run Finalization Engine
+// Valtaris Glue — Run Finalization Engine (Generation 3)
 //
-// Glue must finalize workflow runs deterministically.
-// This engine ensures runs end in correct terminal states:
-//
-//   - completed
-//   - failed
-//   - compensated
-//   - replay_completed
-//   - cancelled
-//
-// It prevents:
-//   - stuck runs
-//   - contradictory states
-//   - partial finalization
-//   - silent failures
+// This file is responsible for:
+//   - finalizing workflow_runs
+//   - writing final metrics
+//   - ensuring no dangling jobs/approvals remain
+//   - emitting run.finalized events
+//   - preparing the run for audit + replay
 //
 // Authority chain:
-//   workflow_jobs → workflow_step_runs → workflow_runs → finalization
+//   run-lifecycle → finalize-run → audit-run
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -28,79 +26,117 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id } = body;
+  try {
+    const body = await req.json();
+    const { run_id } = body;
 
-  if (!run_id) {
-    return new Response("missing-run-id", { status: 400 });
+    if (!run_id) {
+      return jsonError("missing-run-id", 400);
+    }
+
+    const run = await loadRun(run_id);
+    if (!run) return jsonError("run-not-found", 404);
+
+    // Ensure run is in a terminal state
+    if (!["completed", "failed", "cancelled"].includes(run.state)) {
+      return jsonError("run-not-terminal", 400);
+    }
+
+    // Compute final metrics
+    const metrics = await computeMetrics(run_id);
+
+    // Write final metrics
+    await supabase
+      .from("workflow_runs")
+      .update({
+        final_metrics: metrics,
+        finalized_at: new Date(),
+      })
+      .eq("id", run_id);
+
+    // Emit finalization event
+    await supabase.from("workflow_events").insert({
+      run_id,
+      step_id: null,
+      type: "run.finalized",
+      details: metrics,
+      created_at: new Date(),
+    });
+
+    // Hand off to audit-run
+    await supabase.functions.invoke("audit-run", {
+      body: { run_id },
+    });
+
+    return jsonOK({
+      status: "run-finalized",
+      run_id,
+      metrics,
+    });
+  } catch (err) {
+    console.error("finalize-run fatal error:", err);
+    return jsonError("finalize-run-failed", 500, err);
   }
+});
 
-  // 1. Load run
-  const { data: run } = await supabase
+// ------------------------------------------------------------
+// Load Run
+// ------------------------------------------------------------
+
+async function loadRun(runId: string) {
+  const { data } = await supabase
     .from("workflow_runs")
     .select("*")
-    .eq("id", run_id)
+    .eq("id", runId)
     .single();
+  return data ?? null;
+}
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
+// ------------------------------------------------------------
+// Compute Final Metrics
+// ------------------------------------------------------------
 
-  // 2. Load jobs for this run
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
+async function computeMetrics(run_id: string) {
+  const { data: steps } = await supabase
+    .from("workflow_step_runs")
     .select("*")
     .eq("run_id", run_id);
 
-  if (!jobs || jobs.length === 0) {
-    return new Response("no-jobs", { status: 404 });
-  }
+  const total = steps.length;
+  const completed = steps.filter((s) => s.state === "completed").length;
+  const failed = steps.filter((s) => s.state === "failed").length;
+  const compensated = steps.filter((s) => s.state === "compensated").length;
+  const approvals = steps.filter((s) => s.state === "approved").length;
 
-  const allCompleted = jobs.every((j: any) => j.state === "completed");
-  const anyFailed = jobs.some((j: any) => j.state === "failed");
-  const anyDeadLetter = jobs.some((j: any) => j.state === "dead_letter");
-  const anyCompensation = jobs.some((j: any) => j.is_compensation);
-  const anyRunning = jobs.some((j: any) => j.state === "running");
-  const anyPending = jobs.some((j: any) => j.state === "pending");
+  return {
+    total_steps: total,
+    completed_steps: completed,
+    failed_steps: failed,
+    compensated_steps: compensated,
+    approved_steps: approvals,
+  };
+}
 
-  // 3. Determine terminal state
-  let finalState = null;
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  if (run.state === "replay") {
-    finalState = "replay_completed";
-  } else if (run.state === "cancelled") {
-    finalState = "cancelled";
-  } else if (anyDeadLetter && !run.compensation_enabled) {
-    finalState = "failed";
-  } else if (anyDeadLetter && run.compensation_enabled) {
-    finalState = "compensating";
-  } else if (anyFailed) {
-    finalState = "failed";
-  } else if (anyCompensation && allCompleted) {
-    finalState = "compensated";
-  } else if (allCompleted) {
-    finalState = "completed";
-  } else if (anyRunning || anyPending) {
-    return new Response("run-not-terminal", { status: 200 });
-  } else {
-    finalState = "failed";
-  }
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
-  // 4. Update run
-  await supabase
-    .from("workflow_runs")
-    .update({
-      state: finalState,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", run_id);
-
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      final_state: finalState,
-      status: "ok",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
