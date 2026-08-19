@@ -1,16 +1,23 @@
-// supabase/functions/audit-run/index.ts
-// Valtaris Glue — Run Consistency Auditor
+// supabase/functions/repair-run/index.ts
+// Valtaris Glue — Central Run Repair Engine (Generation 3)
 //
-// This file performs a deep audit of a workflow run.
-// It detects and repairs inconsistencies across:
-//   - workflow_runs
-//   - workflow_step_runs
-//   - workflow_jobs
-//   - workflow_dead_letters
-//   - workflow_idempotency
+// This file is responsible for:
+//   - repairing invariant violations
+//   - repairing expired leases
+//   - repairing stuck jobs
+//   - repairing stuck step-runs
+//   - repairing inconsistent run states
+//   - dispatching to job-lifecycle + step-lifecycle
+//   - emitting repair events
 //
 // Authority chain:
-//   audit-run → repair-engines → lifecycle-engines → finalization
+//   check-invariants → repair-run → job-lifecycle / step-lifecycle / run-lifecycle
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs directly
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -20,149 +27,199 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date();
+const NOW_ISO = () => new Date().toISOString();
+
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id } = body;
+  try {
+    const body = await req.json();
+    const { run_id, type, job_id, step_id } = body;
 
-  if (!run_id) {
-    return new Response("missing-run-id", { status: 400 });
+    if (!run_id || !type) {
+      return jsonError("missing-fields", 400);
+    }
+
+    // Emit repair event
+    await emitRepairEvent(run_id, type, job_id, step_id);
+
+    switch (type) {
+      case "expired-lease":
+        await repairExpiredLease(job_id);
+        break;
+
+      case "step-run-timeout":
+        await repairStepTimeout(run_id, step_id);
+        break;
+
+      case "missing-step-run":
+        await repairMissingStepRun(run_id, job_id);
+        break;
+
+      case "invalid-step-run":
+        await repairInvalidStepRun(run_id, step_id);
+        break;
+
+      case "run-completed-with-active-jobs":
+        await forceRunFailed(run_id, "completed_with_active_jobs");
+        break;
+
+      case "run-running-with-no-active-jobs":
+        await forceRunFailed(run_id, "running_with_no_active_jobs");
+        break;
+
+      case "job-running-with-terminal-step":
+        await forceJobFailed(job_id, "terminal_step_state");
+        break;
+
+      case "step-completed-with-noncompleted-job":
+        await forceStepFailed(run_id, step_id, "job_not_completed");
+        break;
+
+      case "run-failed-without-compensation":
+        await forceRunFailed(run_id, "missing_compensation");
+        break;
+
+      default:
+        return jsonError("unknown-repair-type", 400);
+    }
+
+    return jsonOK({
+      status: "repair-complete",
+      run_id,
+      type,
+    });
+  } catch (err) {
+    console.error("repair-run fatal error:", err);
+    return jsonError("repair-run-failed", 500, err);
   }
+});
 
-  // 1. Load run
-  const { data: run } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", run_id)
-    .single();
+// ------------------------------------------------------------
+// Repair Actions
+// ------------------------------------------------------------
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
+async function repairExpiredLease(job_id: string) {
+  await supabase.functions.invoke("job-lifecycle", {
+    body: {
+      job_id,
+      action: "fail",
+      error: "lease-expired",
+    },
+  });
+}
 
-  // 2. Load workflow version
-  const { data: version } = await supabase
-    .from("workflow_versions")
-    .select("*")
-    .eq("id", run.workflow_version_id)
-    .single();
+async function repairStepTimeout(run_id: string, step_id: string) {
+  await supabase.functions.invoke("step-lifecycle", {
+    body: {
+      run_id,
+      step_id,
+      action: "fail",
+      error: "step-timeout",
+    },
+  });
+}
 
-  const graph = version.graph;
+async function repairMissingStepRun(run_id: string, job_id: string) {
+  const job = await loadJob(job_id);
+  if (!job) return;
 
-  // 3. Load all related records
-  const { data: jobs } = await supabase
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id: job.step_id,
+    state: "failed",
+    error: "missing-step-run",
+    created_at: NOW(),
+  });
+}
+
+async function repairInvalidStepRun(run_id: string, step_id: string) {
+  await supabase.from("workflow_step_runs").insert({
+    run_id,
+    step_id,
+    state: "failed",
+    error: "invalid-step-run",
+    created_at: NOW(),
+  });
+}
+
+async function forceRunFailed(run_id: string, reason: string) {
+  await supabase.functions.invoke("run-lifecycle", {
+    body: {
+      run_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+async function forceJobFailed(job_id: string, reason: string) {
+  await supabase.functions.invoke("job-lifecycle", {
+    body: {
+      job_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+async function forceStepFailed(run_id: string, step_id: string, reason: string) {
+  await supabase.functions.invoke("step-lifecycle", {
+    body: {
+      run_id,
+      step_id,
+      action: "fail",
+      error: reason,
+    },
+  });
+}
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadJob(jobId: string) {
+  const { data } = await supabase
     .from("workflow_jobs")
     .select("*")
-    .eq("run_id", run_id);
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
+}
 
-  const { data: steps } = await supabase
-    .from("workflow_step_runs")
-    .select("*")
-    .eq("run_id", run_id);
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
 
-  const { data: dlq } = await supabase
-    .from("workflow_dead_letters")
-    .select("*")
-    .eq("run_id", run_id);
+async function emitRepairEvent(run_id: string, type: string, job_id?: string, step_id?: string) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id: step_id ?? null,
+    type: `repair.${type}`,
+    details: { job_id, step_id },
+    created_at: NOW(),
+  });
+}
 
-  const { data: idem } = await supabase
-    .from("workflow_idempotency")
-    .select("*");
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  const repairs = [];
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
-  // ----------------------------
-  // Check 1: Every step-run must match graph
-  // ----------------------------
-  for (const stepRun of steps) {
-    const node = graph.nodes.find((n: any) => n.id === stepRun.step_id);
-    if (!node) {
-      repairs.push(`step-run ${stepRun.step_id} invalid: not in graph`);
-      await supabase
-        .from("workflow_step_runs")
-        .update({ state: "dead_letter", error: "invalid-step" })
-        .eq("id", stepRun.id);
-    }
-  }
-
-  // ----------------------------
-  // Check 2: Every job must match a step-run
-  // ----------------------------
-  for (const job of jobs) {
-    const stepRun = steps.find((s: any) => s.step_id === job.step_id);
-    if (!stepRun) {
-      repairs.push(`job ${job.id} missing step-run`);
-      await supabase.from("workflow_step_runs").insert({
-        run_id,
-        step_id: job.step_id,
-        state: "pending",
-        created_at: new Date().toISOString(),
-      });
-    }
-  }
-
-  // ----------------------------
-  // Check 3: Every completed job must have idempotency result
-  // ----------------------------
-  for (const job of jobs) {
-    if (job.state === "completed") {
-      const key = `${job.id}-${job.step_id}`;
-      const entry = idem.find((i: any) => i.key === key);
-      if (!entry) {
-        repairs.push(`job ${job.id} missing idempotency result`);
-        await supabase
-          .from("workflow_jobs")
-          .update({ state: "failed", error: "missing-idempotency" })
-          .eq("id", job.id);
-      }
-    }
-  }
-
-  // ----------------------------
-  // Check 4: Every DLQ entry must match a failed job
-  // ----------------------------
-  for (const entry of dlq) {
-    const job = jobs.find((j: any) => j.id === entry.job_id);
-    if (!job || job.state !== "failed") {
-      repairs.push(`DLQ entry ${entry.id} inconsistent with job`);
-      await supabase
-        .from("workflow_dead_letters")
-        .update({ error: "inconsistent-dlq" })
-        .eq("id", entry.id);
-    }
-  }
-
-  // ----------------------------
-  // Check 5: Run terminal state correctness
-  // ----------------------------
-  const allTerminal = jobs.every((j: any) =>
-    ["completed", "failed", "dead_letter", "compensated"].includes(j.state)
-  );
-
-  if (run.state === "running" && allTerminal) {
-    repairs.push("run marked running but all jobs terminal");
-    await supabase.functions.invoke("finalize-run", {
-      body: { run_id },
-    });
-  }
-
-  // ----------------------------
-  // Check 6: Non-terminal run must have runnable jobs
-  // ----------------------------
-  const hasRunnable = jobs.some((j: any) => j.state === "pending");
-
-  if (!allTerminal && !hasRunnable) {
-    repairs.push("run has no runnable jobs but is not terminal");
-    await supabase.functions.invoke("schedule-next-job", {
-      body: { run_id },
-    });
-  }
-
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      repairs,
-      status: "audit-complete",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
