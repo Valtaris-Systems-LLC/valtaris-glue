@@ -1,234 +1,104 @@
 // supabase/functions/connector-wrapper/index.ts
-// Valtaris Glue — Connector Safety Wrapper
+// Valtaris Glue — Connector Wrapper (Generation 3)
 //
-// ALL connector calls must flow through this wrapper.
-// It enforces:
-//   - idempotency
-//   - timeout protection
-//   - retry policy
-//   - error normalization
-//   - payload validation
-//   - logging & telemetry
+// This file is responsible for:
+//   - executing connector adapters safely
+//   - enforcing idempotency keys
+//   - enforcing timeouts
+//   - returning structured results
+//   - returning structured errors
+//   - isolating external systems
 //
 // Authority chain:
-//   execute-step → connector-wrapper → idempotency → connector → normalized result
+//   execute-step → connector-wrapper → adapter → external system
+//
+// This file NEVER:
+//   - mutates workflow_runs
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - retries jobs
+//   - logs step runs (execute-step does that)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const supabase = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
-);
-
-// Timeout for connector calls
-const TIMEOUT_MS = 1000 * 20; // 20 seconds
-
-// Retry policy
-const MAX_RETRIES = 2;
+const DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
 
 serve(async (req) => {
-  const body = await req.json();
-  const { connector, payload, idempotencyKey } = body;
+  try {
+    const body = await req.json();
 
-  if (!connector || !idempotencyKey) {
-    return new Response("missing-connector-or-idempotency-key", { status: 400 });
-  }
-
-  // 1. Check idempotency registry
-  const { data: existing } = await supabase
-    .from("workflow_idempotency")
-    .select("*")
-    .eq("key", idempotencyKey)
-    .single();
-
-  if (existing) {
-    return new Response(
-      JSON.stringify({
-        idempotencyKey,
-        result: existing.result,
-        status: "duplicate",
-      }),
-      { status: 200 }
-    );
-  }
-
-  // 2. Execute connector with retries + timeout
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      const result = await executeWithTimeout(
-        () => dispatchConnector(connector, payload),
-        TIMEOUT_MS
-      );
-
-      // 3. Store idempotency result
-      await supabase.from("workflow_idempotency").insert({
-        key: idempotencyKey,
-        result,
-        created_at: new Date().toISOString(),
-      });
-
-      return new Response(
-        JSON.stringify({
-          idempotencyKey,
-          result,
-          status: "stored",
-        }),
-        { status: 200 }
-      );
-    } catch (err) {
-      lastError = err;
-    }
-  }
-
-  // 4. Return normalized error
-  return new Response(
-    JSON.stringify({
+    const {
+      adapter,
+      run_id,
+      step_id,
+      job_id,
+      node,
+      payload,
       idempotencyKey,
-      error: normalizeError(lastError),
-      status: "failed",
-    }),
-    { status: 500 }
-  );
+    } = body;
+
+    if (!adapter) {
+      return jsonError("missing-adapter", 400);
+    }
+
+    const timeoutMs = node?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+    const result = await executeAdapterWithTimeout(
+      adapter,
+      {
+        run_id,
+        step_id,
+        job_id,
+        node,
+        payload,
+        idempotencyKey,
+      },
+      timeoutMs
+    );
+
+    return jsonOK({
+      status: "connector-executed",
+      result,
+    });
+  } catch (err) {
+    console.error("connector-wrapper fatal error:", err);
+    return jsonError("connector-wrapper-failed", 500, err);
+  }
 });
 
-// ----------------------------
-// Timeout wrapper
-// ----------------------------
+// ------------------------------------------------------------
+// Timeout Wrapper
+// ------------------------------------------------------------
 
-function executeWithTimeout(fn: () => Promise<any>, ms: number) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout")), ms);
-    fn()
-      .then((res) => {
-        clearTimeout(timer);
-        resolve(res);
-      })
-      .catch((err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+async function executeAdapterWithTimeout(adapter: any, args: any, timeoutMs: number) {
+  return await Promise.race([
+    adapter.execute(args),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("connector-timeout")), timeoutMs)
+    ),
+  ]);
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
   });
 }
 
-// ----------------------------
-// Connector dispatch
-// ----------------------------
-
-async function dispatchConnector(name: string, payload: any) {
-  if (name.startsWith("http.")) {
-    return await runHttpConnector(name, payload);
-  }
-
-  if (name.startsWith("supabase.")) {
-    return await runSupabaseConnector(name, payload);
-  }
-
-  if (name.startsWith("ai.")) {
-    return await runAiConnector(name, payload);
-  }
-
-  throw new Error(`unknown-connector: ${name}`);
-}
-
-// ----------------------------
-// HTTP Connector
-// ----------------------------
-
-async function runHttpConnector(name: string, payload: any) {
-  const { url, body } = payload;
-
-  switch (name) {
-    case "http.get":
-      return await fetch(url).then((r) => r.json());
-
-    case "http.post":
-      return await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-
-    case "http.put":
-      return await fetch(url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-
-    case "http.delete":
-      return await fetch(url, { method: "DELETE" }).then((r) => r.json());
-
-    default:
-      throw new Error(`unknown-http-connector: ${name}`);
-  }
-}
-
-// ----------------------------
-// Supabase Connector
-// ----------------------------
-
-async function runSupabaseConnector(name: string, payload: any) {
-  const url = Deno.env.get("SUPABASE_URL")!;
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const client = createClient(url, key);
-
-  const { table, filters, values } = payload;
-
-  switch (name) {
-    case "supabase.select":
-      return await client.from(table).select("*").match(filters);
-
-    case "supabase.insert":
-      return await client.from(table).insert(values).select();
-
-    case "supabase.update":
-      return await client.from(table).update(values).match(filters).select();
-
-    case "supabase.delete":
-      return await client.from(table).delete().match(filters).select();
-
-    default:
-      throw new Error(`unknown-supabase-connector: ${name}`);
-  }
-}
-
-// ----------------------------
-// AI Connector
-// ----------------------------
-
-async function runAiConnector(name: string, payload: any) {
-  const apiKey = Deno.env.get("OPENAI_API_KEY")!;
-  const { prompt } = payload;
-
-  switch (name) {
-    case "ai.generate":
-      return await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: prompt }],
-        }),
-      }).then((r) => r.json());
-
-    default:
-      throw new Error(`unknown-ai-connector: ${name}`);
-  }
-}
-
-// ----------------------------
-// Error normalization
-// ----------------------------
-
-function normalizeError(err: any) {
-  return {
-    message: err?.message ?? "unknown-error",
-    type: err?.name ?? "Error",
-  };
+function jsonError(code: string, status = 500, err?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details: err ? String(err) : undefined,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
 }
