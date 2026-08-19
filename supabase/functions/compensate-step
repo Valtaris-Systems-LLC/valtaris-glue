@@ -1,18 +1,21 @@
 // supabase/functions/compensate-step/index.ts
-// Valtaris Glue — Compensation Step Handler
+// Valtaris Glue — Compensation Executor (Generation 3)
 //
-// Compensation steps allow Glue to recover from failures.
-// When a job enters the dead-letter queue (DLQ), Glue can:
-//   - run a compensation step
-//   - undo or reverse a previous action
-//   - restore workflow state
-//   - continue execution after recovery
-//
-// Compensation is optional and controlled by:
-//   workflow_runs.compensation_enabled
+// This file is responsible for:
+//   - executing compensation steps
+//   - recording workflow_step_runs (compensation)
+//   - emitting workflow_events
+//   - creating downstream compensation jobs
+//   - recording workflow_incidents
 //
 // Authority chain:
-//   workflow_version → graph → compensation edges → job → worker
+//   run-worker → compensate-step → connector-wrapper → adapter
+//
+// This file NEVER:
+//   - mutates workflow_versions
+//   - mutates workflow_runs directly
+//   - bypasses RLS
+//   - executes non-compensation nodes
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -23,86 +26,200 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { run_id, step_id, payload } = body;
+  try {
+    const body = await req.json();
+    const { run_id, step_id, payload } = body;
 
-  if (!run_id || !step_id) {
-    return new Response("missing-run-or-step", { status: 400 });
+    if (!run_id || !step_id) {
+      return jsonError("missing-fields", 400);
+    }
+
+    const run = await loadRun(run_id);
+    if (!run) return jsonError("run-not-found", 404);
+
+    const version = await loadVersion(run.workflow_version_id);
+    if (!version) return jsonError("version-not-found", 404);
+
+    const node = version.graph.nodes.find((n: any) => n.id === step_id);
+    if (!node) return jsonError("step-not-in-graph", 404);
+
+    if (node.type !== "compensation") {
+      return jsonError("not-a-compensation-step", 400);
+    }
+
+    const adapter = await getConnectorAdapter(node.connector);
+    if (node.connector && !adapter) {
+      return jsonError("connector-adapter-not-found", 500);
+    }
+
+    // Execute compensation
+    const result = await executeCompensation({
+      run_id,
+      step_id,
+      node,
+      adapter,
+      payload,
+    });
+
+    // Record compensation step run
+    await supabase.from("workflow_step_runs").insert({
+      run_id,
+      step_id,
+      job_id: null,
+      state: "compensated",
+      result,
+      created_at: new Date(),
+    });
+
+    // Workflow event
+    await supabase.from("workflow_events").insert({
+      run_id,
+      step_id,
+      type: "step.compensated",
+      created_at: new Date(),
+    });
+
+    // Downstream compensation graph
+    await createDownstreamCompensation(run_id, version, step_id);
+
+    return jsonOK({
+      status: "compensated",
+      run_id,
+      step_id,
+      result,
+    });
+  } catch (err) {
+    console.error("compensate-step fatal error:", err);
+
+    await supabase.from("workflow_incidents").insert({
+      run_id: null,
+      step_id: null,
+      type: "compensation.error",
+      error: String(err),
+      created_at: new Date(),
+    });
+
+    return jsonError("compensation-failed", 500, err);
   }
+});
 
-  // 1. Load workflow run
-  const { data: run } = await supabase
+// ------------------------------------------------------------
+// Load Run + Version
+// ------------------------------------------------------------
+
+async function loadRun(runId: string) {
+  const { data } = await supabase
     .from("workflow_runs")
     .select("*")
-    .eq("id", run_id)
+    .eq("id", runId)
     .single();
+  return data ?? null;
+}
 
-  if (!run) {
-    return new Response("run-not-found", { status: 404 });
-  }
-
-  if (!run.compensation_enabled) {
-    return new Response("compensation-disabled", { status: 403 });
-  }
-
-  // 2. Load workflow version (single authority)
-  const { data: version } = await supabase
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
     .from("workflow_versions")
     .select("*")
-    .eq("id", run.workflow_version_id)
+    .eq("id", versionId)
     .single();
+  return data ?? null;
+}
 
-  if (!version) {
-    return new Response("version-not-found", { status: 404 });
+// ------------------------------------------------------------
+// Connector Adapter
+// ------------------------------------------------------------
+
+async function getConnectorAdapter(connector: string | undefined) {
+  if (!connector) return null;
+
+  const { data, error } = await supabase.functions.invoke("connector-registry", {
+    body: { connector },
+  });
+
+  if (error) {
+    console.error("connector-registry error:", error);
+    return null;
   }
 
-  const graph = version.graph;
+  return data?.adapter ?? null;
+}
 
-  // 3. Validate compensation step exists
-  const step = graph.nodes.find((n: any) => n.id === step_id);
+// ------------------------------------------------------------
+// Execute Compensation
+// ------------------------------------------------------------
 
-  if (!step) {
-    return new Response("step-not-found", { status: 404 });
+async function executeCompensation({
+  run_id,
+  step_id,
+  node,
+  adapter,
+  payload,
+}: any) {
+  if (!node.connector) {
+    return { noop: true };
   }
 
-  if (step.type !== "compensate") {
-    return new Response("not-a-compensation-step", { status: 400 });
-  }
+  const idempotencyKey = `compensate:${run_id}:${step_id}`;
 
-  // 4. Enqueue compensation job
-  const { data: job, error: jobErr } = await supabase
-    .from("workflow_jobs")
-    .insert({
+  const { data, error } = await supabase.functions.invoke("connector-wrapper", {
+    body: {
+      adapter,
       run_id,
       step_id,
-      state: "pending",
-      attempt: 0,
-      payload: payload ?? {},
-      is_compensation: true,
-      created_at: new Date().toISOString(),
-    })
-    .select("*")
-    .single();
+      job_id: null,
+      node,
+      payload,
+      idempotencyKey,
+    },
+  });
 
-  if (jobErr) {
-    return new Response("compensation-job-create-failed", { status: 500 });
+  if (error) {
+    console.error("connector-wrapper error:", error);
+    throw new Error("compensation-execution-failed");
   }
 
-  // 5. Mark run as "compensating"
-  await supabase
-    .from("workflow_runs")
-    .update({
-      state: "compensating",
-    })
-    .eq("id", run.id);
+  return data;
+}
 
+// ------------------------------------------------------------
+// Downstream Compensation Graph
+// ------------------------------------------------------------
+
+async function createDownstreamCompensation(runId: string, version: any, stepId: string) {
+  const node = version.graph.nodes.find((n: any) => n.id === stepId);
+  if (!node) return;
+
+  const nextIds = node.on_compensation ?? [];
+  if (!nextIds.length) return;
+
+  for (const nextId of nextIds) {
+    await supabase.rpc("ensure_downstream_job", {
+      p_run_id: runId,
+      p_step_id: nextId,
+    });
+  }
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      run_id,
-      step_id,
-      job_id: job.id,
-      status: "compensation-enqueued",
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
