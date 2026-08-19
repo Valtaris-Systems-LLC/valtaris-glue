@@ -1,150 +1,133 @@
 // supabase/functions/execute-step/index.ts
-// Valtaris Glue — Unified Step Executor
+// Valtaris Glue — Unified Step Executor (Generation 3)
 //
-// This replaces all legacy step execution paths.
-// It is ONLY called by run-worker.
-// It NEVER mutates workflow_runs directly.
-// It NEVER bypasses workflow_versions.
-// It NEVER executes connectors without idempotency keys.
+// This file is the ONLY place where step execution happens.
+// It is called exclusively by run-worker.
+// It enforces:
+//   - version-pinned execution
+//   - idempotency key propagation
+//   - connector adapter isolation
+//   - structured error propagation
+//   - no direct mutation of workflow_runs
+//   - no bypass of workflow_versions
 //
 // Authority chain:
-//   run-worker → execute-step → connector → result
+//   run-worker → execute-step → connector-wrapper → adapter → external system
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
 
 serve(async (req) => {
-  const body = await req.json();
-  const { name, payload, idempotencyKey } = body;
-
-  if (!name) {
-    return new Response("missing-task-name", { status: 400 });
-  }
-
-  // 1. Dispatch to connector bindings
   try {
-    const result = await dispatchTask(name, payload, idempotencyKey);
+    const body = await req.json();
 
-    return new Response(JSON.stringify(result), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+    const {
+      run_id,
+      step_id,
+      job_id,
+      node,
+      adapter,
+      payload,
+    } = body;
+
+    if (!run_id || !step_id || !job_id || !node) {
+      return jsonError("missing-required-fields", 400);
+    }
+
+    // Idempotency key is ALWAYS job_id
+    const idempotencyKey = job_id;
+
+    // Execute via connector-wrapper → adapter
+    const result = await executeAdapter({
+      run_id,
+      step_id,
+      job_id,
+      node,
+      adapter,
+      payload,
+      idempotencyKey,
+    });
+
+    return jsonOK({
+      status: "step-executed",
+      run_id,
+      step_id,
+      job_id,
+      result,
     });
   } catch (err) {
-    return new Response(
-      JSON.stringify({ error: err.message }),
-      { status: 500 }
-    );
+    console.error("execute-step fatal error:", err);
+    return jsonError("execute-step-failed", 500, err);
   }
 });
 
-// ----------------------------
-// Task Dispatch
-// ----------------------------
+// ------------------------------------------------------------
+// Adapter Execution
+// ------------------------------------------------------------
 
-async function dispatchTask(name: string, payload: any, idempotencyKey: string) {
-  // All connectors must be registered here.
-  // This is the ONLY place tasks are executed.
-
-  if (name.startsWith("http.")) {
-    return await runHttpTask(name, payload, idempotencyKey);
+async function executeAdapter({
+  run_id,
+  step_id,
+  job_id,
+  node,
+  adapter,
+  payload,
+  idempotencyKey,
+}: any) {
+  // If node has no connector, treat as a no-op step
+  if (!node.connector) {
+    return { noop: true };
   }
 
-  if (name.startsWith("supabase.")) {
-    return await runSupabaseTask(name, payload, idempotencyKey);
+  if (!adapter) {
+    throw new Error("connector-adapter-not-found");
   }
 
-  if (name.startsWith("ai.")) {
-    return await runAiTask(name, payload, idempotencyKey);
+  const { data, error } = await supabase.functions.invoke("connector-wrapper", {
+    body: {
+      adapter,
+      run_id,
+      step_id,
+      job_id,
+      node,
+      payload,
+      idempotencyKey,
+    },
+  });
+
+  if (error) {
+    console.error("connector-wrapper error:", error);
+    throw new Error("connector-execution-failed");
   }
 
-  throw new Error(`unknown-task: ${name}`);
+  return data;
 }
 
-// ----------------------------
-// HTTP Connector
-// ----------------------------
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-async function runHttpTask(name: string, payload: any, idempotencyKey: string) {
-  const url = payload.url;
-  const body = payload.body;
-
-  switch (name) {
-    case "http.get":
-      return await fetch(url).then((r) => r.json());
-
-    case "http.post":
-      return await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-
-    case "http.put":
-      return await fetch(url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }).then((r) => r.json());
-
-    case "http.delete":
-      return await fetch(url, { method: "DELETE" }).then((r) => r.json());
-
-    default:
-      throw new Error(`unknown-http-task: ${name}`);
-  }
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
-// ----------------------------
-// Supabase Connector
-// ----------------------------
-
-async function runSupabaseTask(name: string, payload: any, idempotencyKey: string) {
-  const url = Deno.env.get("SUPABASE_URL")!;
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const client = createClient(url, key);
-
-  const { table, filters, values } = payload;
-
-  switch (name) {
-    case "supabase.select":
-      return await client.from(table).select("*").match(filters);
-
-    case "supabase.insert":
-      return await client.from(table).insert(values).select();
-
-    case "supabase.update":
-      return await client.from(table).update(values).match(filters).select();
-
-    case "supabase.delete":
-      return await client.from(table).delete().match(filters).select();
-
-    default:
-      throw new Error(`unknown-supabase-task: ${name}`);
-  }
-}
-
-// ----------------------------
-// AI Connector
-// ----------------------------
-
-async function runAiTask(name: string, payload: any, idempotencyKey: string) {
-  const apiKey = Deno.env.get("OPENAI_API_KEY")!;
-  const { prompt } = payload;
-
-  switch (name) {
-    case "ai.generate":
-      return await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: prompt }],
-        }),
-      }).then((r) => r.json());
-
-    default:
-      throw new Error(`unknown-ai-task: ${name}`);
-  }
+function jsonError(code: string, status = 500, err?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details: err ? String(err) : undefined,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
 }
