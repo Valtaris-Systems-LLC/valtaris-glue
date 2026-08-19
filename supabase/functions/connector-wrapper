@@ -10,7 +10,7 @@
 //   - isolating external systems
 //
 // Authority chain:
-//   execute-step → connector-wrapper → adapter → external system
+// execute-step → connector-wrapper → adapter → external system
 //
 // This file NEVER:
 //   - mutates workflow_runs
@@ -26,7 +26,6 @@ const DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
 serve(async (req) => {
   try {
     const body = await req.json();
-
     const {
       adapter,
       run_id,
@@ -61,8 +60,10 @@ serve(async (req) => {
       result,
     });
   } catch (err) {
-    console.error("connector-wrapper fatal error:", err);
-    return jsonError("connector-wrapper-failed", 500, err);
+    return jsonError("connector-wrapper-failed", 500, {
+      message: String(err),
+      stack: err?.stack,
+    });
   }
 });
 
@@ -70,13 +71,45 @@ serve(async (req) => {
 // Timeout Wrapper
 // ------------------------------------------------------------
 
-async function executeAdapterWithTimeout(adapter: any, args: any, timeoutMs: number) {
+async function executeAdapterWithTimeout(
+  adapter: string,
+  args: any,
+  timeoutMs: number
+) {
   return await Promise.race([
-    adapter.execute(args),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("connector-timeout")), timeoutMs)
-    ),
+    executeAdapter(adapter, args),
+    timeoutPromise(timeoutMs),
   ]);
+}
+
+function timeoutPromise(ms: number) {
+  return new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Connector timeout after ${ms}ms`)), ms)
+  );
+}
+
+// ------------------------------------------------------------
+// Adapter Execution
+// ------------------------------------------------------------
+
+async function executeAdapter(adapter: string, args: any) {
+  const url = `https://valtaris-connectors.valtaris.dev/${adapter}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Idempotency-Key": args.idempotencyKey,
+    },
+    body: JSON.stringify(args),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Adapter error (${res.status}): ${text}`);
+  }
+
+  return await res.json();
 }
 
 // ------------------------------------------------------------
@@ -90,11 +123,11 @@ function jsonOK(obj: any) {
   });
 }
 
-function jsonError(code: string, status = 500, err?: any) {
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
       error: code,
-      details: err ? String(err) : undefined,
+      details,
     }),
     {
       status,
