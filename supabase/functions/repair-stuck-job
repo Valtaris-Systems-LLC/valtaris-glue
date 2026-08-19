@@ -1,20 +1,5 @@
-// supabase/functions/repair-stuck-job/index.ts
-// Valtaris Glue — Stuck Job Repair Engine (Generation 2)
-//
-// Responsibilities:
-//   - Detect expired leases
-//   - Detect stuck jobs (running too long)
-//   - Detect jobs whose worker crashed mid-execution
-//   - Reset job state safely
-//   - Requeue job for execution
-//   - Preserve provenance
-//
-// Contract:
-//   - Does NOT execute connectors
-//   - Does NOT mutate downstream jobs
-//   - Only resets jobs that are safe to retry
-//   - Must be idempotent
-//   - Called by scheduler, SLA sweeper, or manually
+// supabase/functions/repair-stuck-jobs/index.ts
+// Valtaris Glue — Stuck Job Repair Engine (Generation 3)
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -24,87 +9,140 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const MAX_JOB_RUNTIME_MS = 5 * 60 * 1000; // 5 minutes
+const now = () => new Date();
+const nowIso = () => new Date().toISOString();
 
-serve(async (req) => {
-  const body = await req.json().catch(() => ({}));
-  const { job_id } = body;
+serve(async () => {
+  try {
+    await repairExpiredLeases();
+    await repairStuckRetrying();
+    await repairDelayedJobsWithExpiredApprovals();
 
-  if (!job_id) {
-    return new Response("missing-job-id", { status: 400 });
+    return jsonOK({ status: "job-repair-complete" });
+  } catch (err) {
+    console.error("repair-stuck-jobs fatal:", err);
+    return jsonError("repair-failed", 500, err);
   }
+});
 
-  // 1. Load job
-  const { data: jobData, error: jobError } = await supabase
+// ------------------------------------------------------------
+// Expired leases → fail job
+// ------------------------------------------------------------
+
+async function repairExpiredLeases() {
+  const { data: jobs } = await supabase
     .from("workflow_jobs")
     .select("*")
-    .eq("id", job_id)
+    .eq("state", "running")
+    .lt("lease_expires_at", nowIso());
+
+  if (!jobs?.length) return;
+
+  for (const job of jobs) {
+    await supabase.functions.invoke("job-lifecycle", {
+      body: {
+        job_id: job.id,
+        action: "fail",
+        error: "lease-expired",
+      },
+    });
+  }
+}
+
+// ------------------------------------------------------------
+// Stuck retrying → backoff expired
+// ------------------------------------------------------------
+
+async function repairStuckRetrying() {
+  const { data: jobs } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("state", "retrying")
+    .lt("backoff_until", nowIso());
+
+  if (!jobs?.length) return;
+
+  for (const job of jobs) {
+    await supabase
+      .from("workflow_jobs")
+      .update({
+        state: "pending",
+        scheduled_at: null,
+      })
+      .eq("id", job.id);
+  }
+}
+
+// ------------------------------------------------------------
+// Delayed jobs with expired approvals → dead-letter
+// ------------------------------------------------------------
+
+async function repairDelayedJobsWithExpiredApprovals() {
+  const { data: approvals } = await supabase
+    .from("workflow_approvals")
+    .select("*")
+    .eq("state", "pending")
+    .lt("expires_at", nowIso());
+
+  if (!approvals?.length) return;
+
+  for (const approval of approvals) {
+    await supabase
+      .from("workflow_approvals")
+      .update({
+        state: "expired",
+        expired_at: now(),
+      })
+      .eq("id", approval.id);
+
+    const jobId = await findJobId(approval.run_id, approval.step_id);
+
+    if (jobId) {
+      await supabase.functions.invoke("dead-letter", {
+        body: {
+          job_id: jobId,
+          error: "approval-expired",
+        },
+      });
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// Helper
+// ------------------------------------------------------------
+
+async function findJobId(runId: string, stepId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("id")
+    .eq("run_id", runId)
+    .eq("step_id", stepId)
     .single();
 
-  if (jobError || !jobData) {
-    return new Response("job-not-found", { status: 404 });
-  }
+  return data?.id ?? null;
+}
 
-  const job = jobData;
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  // 2. Check lease expiration
-  const now = Date.now();
-  const leaseExpired =
-    job.lease_expires_at && new Date(job.lease_expires_at).getTime() < now;
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
-  // 3. Check stuck execution (running too long)
-  const runningTooLong =
-    job.claimed_at &&
-    now - new Date(job.claimed_at).getTime() > MAX_JOB_RUNTIME_MS;
-
-  if (!leaseExpired && !runningTooLong) {
-    return new Response(
-      JSON.stringify({
-        status: "job-not-stuck",
-        job_id,
-      }),
-      { status: 200 }
-    );
-  }
-
-  // 4. Reset job state
-  const { error: resetError } = await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "pending",
-      claimed_at: null,
-      lease_expires_at: null,
-      error: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", job_id);
-
-  if (resetError) {
-    console.error("reset-job-error", resetError);
-    return new Response("job-reset-failed", { status: 500 });
-  }
-
-  // 5. Record provenance
-  await supabase.from("workflow_job_repair").insert({
-    job_id,
-    run_id: job.run_id,
-    step_id: job.step_id,
-    reason: leaseExpired
-      ? "lease-expired"
-      : "running-too-long",
-    repaired_at: new Date().toISOString(),
-  }).catch(() => {});
-
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
     JSON.stringify({
-      status: "job-repaired",
-      job_id,
-      run_id: job.run_id,
-      step_id: job.step_id,
-      reason: leaseExpired
-        ? "lease-expired"
-        : "running-too-long",
+      error: code,
+      details: err ? String(err) : undefined,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
