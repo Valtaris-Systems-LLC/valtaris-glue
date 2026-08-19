@@ -1,492 +1,145 @@
-// Operator approval decision — identity-bound.
+// supabase/functions/dead-letter/index.ts
+// Valtaris Glue — Dead Letter Queue Handler (Generation 3)
 //
-// POST {
-//   approval_id: string,
-//   decision: "approve" | "reject",
-//   reason?: string
-// }
+// This file is responsible for:
+//   - marking jobs as dead_letter
+//   - recording workflow_dead_letter entries
+//   - recording workflow_incidents
+//   - recording workflow_step_runs (failed)
+//   - emitting workflow_events
+//   - preserving version-pinned execution semantics
 //
-// The acting operator is always derived from the authenticated JWT.
-// The database RPC remains the authority for tenant/role/approval-state
-// validation and mutation.
+// Authority chain:
+//   run-worker → job-lifecycle → dead-letter
+//
+// This file NEVER:
+//   - mutates workflow_versions
+//   - mutates workflow_runs directly
+//   - bypasses RLS
+//   - executes connectors
+//   - retries jobs
 
-import {
-  requireUser,
-  serviceClient,
-  logSecurity,
-} from "../_shared/auth.ts";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const cors = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods":
-    "POST, OPTIONS",
-};
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
 
-type Decision = "approve" | "reject";
-
-interface ApprovalDecisionRequest {
-  approval_id?: unknown;
-  decision?: unknown;
-  reason?: unknown;
-}
-
-function json(
-  body: unknown,
-  status = 200,
-) {
-  return new Response(
-    JSON.stringify(body),
-    {
-      status,
-      headers: {
-        ...cors,
-        "Content-Type": "application/json",
-      },
-    },
-  );
-}
-
-function cleanString(
-  value: unknown,
-): string | null {
-  if (
-    typeof value !== "string"
-  ) {
-    return null;
-  }
-
-  const trimmed = value.trim();
-
-  return trimmed.length > 0
-    ? trimmed
-    : null;
-}
-
-function isDecision(
-  value: unknown,
-): value is Decision {
-  return (
-    value === "approve" ||
-    value === "reject"
-  );
-}
-
-function errorMessage(
-  error: unknown,
-): string {
-  return error instanceof Error
-    ? error.message
-    : String(error);
-}
-
-async function kickWorker() {
-  const url =
-    Deno.env.get("SUPABASE_URL");
-
-  const key =
-    Deno.env.get(
-      "SUPABASE_SERVICE_ROLE_KEY",
-    );
-
-  if (!url || !key) {
-    throw new Error(
-      "worker runtime configuration missing",
-    );
-  }
-
-  await fetch(
-    `${url}/functions/v1/run-worker`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type":
-          "application/json",
-        Authorization:
-          `Bearer ${key}`,
-      },
-      body: "{}",
-    },
-  );
-}
-
-Deno.serve(async (req) => {
-  if (
-    req.method === "OPTIONS"
-  ) {
-    return new Response(
-      "ok",
-      { headers: cors },
-    );
-  }
-
-  if (
-    req.method !== "POST"
-  ) {
-    return json(
-      {
-        error:
-          "method not allowed",
-      },
-      405,
-    );
-  }
-
-  /*
-   * ------------------------------------------------------------
-   * 1. Authenticate the operator.
-   *
-   * Never accept actor identity from the request body.
-   * ------------------------------------------------------------
-   */
-
-  const auth =
-    await requireUser(req);
-
-  if (!auth.ok) {
-    return json(
-      {
-        error: auth.error,
-      },
-      auth.status,
-    );
-  }
-
-  const operatorUid =
-    auth.ctx.userId;
-
-  const sb =
-    serviceClient();
-
-  /*
-   * ------------------------------------------------------------
-   * 2. Parse and validate the request.
-   * ------------------------------------------------------------
-   */
-
-  let body:
-    | ApprovalDecisionRequest;
-
+serve(async (req) => {
   try {
-    body =
-      (await req.json()) as
-        ApprovalDecisionRequest;
-  } catch {
-    return json(
-      {
-        error:
-          "invalid JSON body",
-      },
-      400,
-    );
-  }
+    const body = await req.json();
+    const { job_id, error } = body;
 
-  const approvalId =
-    cleanString(
-      body.approval_id,
-    );
+    if (!job_id) {
+      return jsonError("missing-job-id", 400);
+    }
 
-  const decision =
-    body.decision;
+    const job = await loadJob(job_id);
+    if (!job) {
+      return jsonError("job-not-found", 404);
+    }
 
-  const reason =
-    cleanString(
-      body.reason,
-    );
+    await markDeadLetter(job, error ?? "dead-letter");
 
-  if (!approvalId) {
-    return json(
-      {
-        error:
-          "approval_id required",
-      },
-      400,
-    );
-  }
-
-  if (
-    !isDecision(decision)
-  ) {
-    return json(
-      {
-        error:
-          "decision must be approve or reject",
-      },
-      400,
-    );
-  }
-
-  /*
-   * Keep rejection reasons bounded. This prevents an operator from
-   * accidentally turning the approval record/audit trail into an
-   * unbounded payload sink.
-   */
-  if (
-    reason &&
-    reason.length > 2000
-  ) {
-    return json(
-      {
-        error:
-          "reason exceeds maximum length",
-      },
-      400,
-    );
-  }
-
-  /*
-   * ------------------------------------------------------------
-   * 3. Execute the identity-bound database transition.
-   *
-   * The RPC is intentionally responsible for:
-   *   - locating the approval
-   *   - checking tenant membership
-   *   - checking operator privilege
-   *   - validating current approval state
-   *   - mutating the approval/job/run atomically
-   *
-   * The edge function never performs those mutations directly.
-   * ------------------------------------------------------------
-   */
-
-  const rpcName =
-    decision === "approve"
-      ? "resume_after_approval"
-      : "reject_approval";
-
-  const rpcArgs: Record<
-    string,
-    unknown
-  > =
-    decision === "approve"
-      ? {
-          _approval_id:
-            approvalId,
-          _operator_uid:
-            operatorUid,
-        }
-      : {
-          _approval_id:
-            approvalId,
-          _operator_uid:
-            operatorUid,
-          _reason:
-            reason,
-        };
-
-  const {
-    error: rpcError,
-  } = await sb.rpc(
-    rpcName,
-    rpcArgs,
-  );
-
-  if (rpcError) {
-    /*
-     * Do not classify every database error as authorization failure.
-     *
-     * The RPC is the source of truth for the actual transition. A
-     * permission/state/tenant rejection is client-visible as 403,
-     * while an unexpected database/runtime failure is a 500.
-     */
-    const message =
-      rpcError.message ??
-      "approval transition failed";
-
-    const lowered =
-      message.toLowerCase();
-
-    const authorizationFailure =
-      lowered.includes(
-        "forbidden",
-      ) ||
-      lowered.includes(
-        "not authorized",
-      ) ||
-      lowered.includes(
-        "unauthorized",
-      ) ||
-      lowered.includes(
-        "operator role",
-      ) ||
-      lowered.includes(
-        "permission denied",
-      ) ||
-      lowered.includes(
-        "tenant",
-      );
-
-    const invalidState =
-      lowered.includes(
-        "already approved",
-      ) ||
-      lowered.includes(
-        "already rejected",
-      ) ||
-      lowered.includes(
-        "expired",
-      ) ||
-      lowered.includes(
-        "not pending",
-      );
-
-    await logSecurity({
-      actor_user_id:
-        operatorUid,
-      category:
-        authorizationFailure
-          ? "authz.denied"
-          : "approval.transition_failed",
-      severity:
-        authorizationFailure
-          ? "warn"
-          : "error",
-      subject_type:
-        "approval",
-      subject_id:
-        approvalId,
-      message:
-        authorizationFailure
-          ? `approval ${decision} denied`
-          : `approval ${decision} transition failed`,
-      details: {
-        decision,
-        rpc:
-          rpcName,
-        error:
-          message,
-      },
+    return jsonOK({
+      status: "dead_letter",
+      job_id,
+      run_id: job.run_id,
+      step_id: job.step_id,
     });
-
-    if (
-      authorizationFailure
-    ) {
-      return json(
-        {
-          error:
-            "forbidden",
-        },
-        403,
-      );
-    }
-
-    if (invalidState) {
-      return json(
-        {
-          error:
-            message,
-          approval_id:
-            approvalId,
-          decision,
-        },
-        409,
-      );
-    }
-
-    console.error(
-      "[approval-decision] RPC error",
-      {
-        approval_id:
-          approvalId,
-        decision,
-        rpc: rpcName,
-        error: message,
-      },
-    );
-
-    return json(
-      {
-        error:
-          "approval transition failed",
-      },
-      500,
-    );
+  } catch (err) {
+    console.error("dead-letter fatal error:", err);
+    return jsonError("dead-letter-failed", 500, err);
   }
+});
 
-  /*
-   * ------------------------------------------------------------
-   * 4. Record the successful operator action.
-   *
-   * The actual durable approval mutation already happened inside the
-   * RPC. This event is supplemental observability/security telemetry.
-   * ------------------------------------------------------------
-   */
+// ------------------------------------------------------------
+// Load Job
+// ------------------------------------------------------------
 
-  await logSecurity({
-    actor_user_id:
-      operatorUid,
-    category:
-      `approval.${decision}`,
-    severity:
-      "info",
-    subject_type:
-      "approval",
-    subject_id:
-      approvalId,
-    message:
-      `approval ${decision} completed`,
-    details: {
-      decision,
-      reason:
-        decision === "reject"
-          ? reason
-          : null,
-    },
+async function loadJob(jobId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
+}
+
+// ------------------------------------------------------------
+// Mark Dead Letter
+// ------------------------------------------------------------
+
+async function markDeadLetter(job: any, reason: string) {
+  // 1. Mark job as dead_letter
+  await supabase
+    .from("workflow_jobs")
+    .update({
+      state: "dead_letter",
+      completed_at: new Date(),
+    })
+    .eq("id", job.id);
+
+  // 2. Record step run
+  await supabase.from("workflow_step_runs").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    state: "failed",
+    error: reason,
+    created_at: new Date(),
   });
 
-  /*
-   * ------------------------------------------------------------
-   * 5. Kick the durable worker.
-   *
-   * Approval and rejection both change durable workflow state:
-   * approval can release execution, while rejection can unblock
-   * terminal run processing/dead-letter handling.
-   *
-   * The database transition has already been committed, so failure
-   * to kick the worker does NOT invalidate the operator decision.
-   * The queue remains durable and another worker invocation can drain it.
-   * ------------------------------------------------------------
-   */
+  // 3. Record DLQ entry
+  await supabase.from("workflow_dead_letter").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    error: reason,
+    created_at: new Date(),
+  });
 
-  try {
-    await kickWorker();
-  } catch (error) {
-    console.error(
-      "[approval-decision] worker kick failed",
-      errorMessage(error),
-    );
+  // 4. Record incident
+  await supabase.from("workflow_incidents").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "dead_letter",
+    error: reason,
+    created_at: new Date(),
+  });
 
-    await logSecurity({
-      actor_user_id:
-        operatorUid,
-      category:
-        "worker.kick_failed",
-      severity:
-        "warn",
-      subject_type:
-        "approval",
-      subject_id:
-        approvalId,
-      message:
-        "approval decision committed but worker kick failed",
-      details: {
-        decision,
-        error:
-          errorMessage(error),
-      },
-    });
-  }
+  // 5. Emit workflow event
+  await supabase.from("workflow_events").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "step.dead_letter",
+    error: reason,
+    created_at: new Date(),
+  });
+}
 
-  return json(
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details: err ? String(err) : undefined,
+    }),
     {
-      ok: true,
-      approval_id:
-        approvalId,
-      decision,
-      actor_user_id:
-        operatorUid,
-    },
-    200,
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
