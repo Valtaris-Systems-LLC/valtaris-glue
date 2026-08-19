@@ -3,16 +3,17 @@
 //
 // This file is the ONLY place where step execution happens.
 // It is called exclusively by run-worker.
+//
 // It enforces:
-//   - version-pinned execution
-//   - idempotency key propagation
-//   - connector adapter isolation
-//   - structured error propagation
-//   - no direct mutation of workflow_runs
-//   - no bypass of workflow_versions
+// - version-pinned execution
+// - idempotency key propagation
+// - connector adapter isolation
+// - structured error propagation
+// - no direct mutation of workflow_runs
+// - no bypass of workflow_versions
 //
 // Authority chain:
-//   run-worker → execute-step → connector-wrapper → adapter → external system
+// run-worker → execute-step → connector-wrapper → adapter → external system
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -25,7 +26,6 @@ const supabase = createClient(
 serve(async (req) => {
   try {
     const body = await req.json();
-
     const {
       run_id,
       step_id,
@@ -62,7 +62,11 @@ serve(async (req) => {
     });
   } catch (err) {
     console.error("execute-step fatal error:", err);
-    return jsonError("execute-step-failed", 500, err);
+
+    return jsonError("execute-step-failed", 500, {
+      message: String(err),
+      stack: err?.stack,
+    });
   }
 });
 
@@ -78,31 +82,30 @@ async function executeAdapter({
   adapter,
   payload,
   idempotencyKey,
-}: any) {
-  // If node has no connector, treat as a no-op step
-  if (!node.connector) {
-    return { noop: true };
-  }
-
-  if (!adapter) {
-    throw new Error("connector-adapter-not-found");
-  }
-
+}: {
+  run_id: string;
+  step_id: string;
+  job_id: string;
+  node: any;
+  adapter: string;
+  payload: any;
+  idempotencyKey: string;
+}) {
+  // All adapter execution flows through connector-wrapper
   const { data, error } = await supabase.functions.invoke("connector-wrapper", {
     body: {
       adapter,
-      run_id,
-      step_id,
-      job_id,
       node,
       payload,
       idempotencyKey,
+      run_id,
+      step_id,
+      job_id,
     },
   });
 
   if (error) {
-    console.error("connector-wrapper error:", error);
-    throw new Error("connector-execution-failed");
+    throw new Error(`Adapter execution failed: ${error}`);
   }
 
   return data;
@@ -119,11 +122,11 @@ function jsonOK(obj: any) {
   });
 }
 
-function jsonError(code: string, status = 500, err?: any) {
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
       error: code,
-      details: err ? String(err) : undefined,
+      details,
     }),
     {
       status,
