@@ -1,5 +1,21 @@
-// supabase/functions/run-worker/index.ts
-// Valtaris Glue — Durable Worker Runtime (Generation 3)
+// supabase/functions/worker-finalize/index.ts
+// Valtaris Glue — Worker Finalization Engine (Generation 3)
+//
+// This file is responsible for:
+//   - finalizing job execution inside the worker
+//   - reporting job completion or failure
+//   - releasing job leases
+//   - emitting worker.finalized events
+//   - handing control back to job-lifecycle + step-lifecycle
+//
+// Authority chain:
+//   run-worker → worker-finalize → job-lifecycle → step-lifecycle → schedule-next-job
+//
+// This file NEVER:
+//   - executes connectors
+//   - mutates workflow_versions
+//   - bypasses RLS
+//   - schedules jobs directly
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -9,239 +25,127 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const LEASE_MS = 30000;
-const HEARTBEAT_MS = 10000;
-const MAX_ATTEMPTS = 3;
+const NOW = () => new Date();
 
-async function claimNextJob() {
-  const { data, error } = await supabase.rpc("claim_next_job", {});
-  if (error) {
-    console.error("claim_next_job error", error);
-    return null;
+serve(async (req) => {
+  try {
+    const body = await req.json();
+    const { job_id, worker_id, status, result, error } = body;
+
+    if (!job_id || !worker_id || !status) {
+      return jsonError("missing-fields", 400);
+    }
+
+    const job = await loadJob(job_id);
+    if (!job) return jsonError("job-not-found", 404);
+
+    // Emit worker.finalized event
+    await emitEvent(job.run_id, job.step_id, "worker.finalized", {
+      worker_id,
+      job_id,
+      status,
+      result,
+      error,
+    });
+
+    // Release lease
+    await releaseLease(job_id, worker_id);
+
+    // Forward to job-lifecycle
+    if (status === "completed") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: {
+          job_id,
+          action: "complete",
+          result,
+        },
+      });
+    } else if (status === "failed") {
+      await supabase.functions.invoke("job-lifecycle", {
+        body: {
+          job_id,
+          action: "fail",
+          error,
+        },
+      });
+    } else {
+      return jsonError("invalid-status", 400);
+    }
+
+    return jsonOK({
+      status: "worker-finalized",
+      job_id,
+      worker_id,
+      lifecycle_action: status,
+    });
+  } catch (err) {
+    console.error("worker-finalize fatal error:", err);
+    return jsonError("worker-finalize-failed", 500, err);
   }
+});
+
+// ------------------------------------------------------------
+// Load Job
+// ------------------------------------------------------------
+
+async function loadJob(jobId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("id", jobId)
+    .single();
   return data ?? null;
 }
 
-async function renewLease(jobId: string) {
-  const leaseExpiresAt = new Date(Date.now() + LEASE_MS).toISOString();
+// ------------------------------------------------------------
+// Release Lease
+// ------------------------------------------------------------
+
+async function releaseLease(job_id: string, worker_id: string) {
   await supabase
     .from("workflow_jobs")
     .update({
-      lease_expires_at: leaseExpiresAt,
-      claimed_at: new Date().toISOString(),
+      claimed_by: null,
+      lease_expires_at: null,
     })
-    .eq("id", jobId);
+    .eq("id", job_id)
+    .eq("claimed_by", worker_id);
 }
 
-async function loadRun(runId: string) {
-  const { data } = await supabase
-    .from("workflow_runs")
-    .select("*")
-    .eq("id", runId)
-    .single();
-  return data ?? null;
-}
+// ------------------------------------------------------------
+// Event Helper
+// ------------------------------------------------------------
 
-async function loadVersion(versionId: string) {
-  const { data } = await supabase
-    .from("workflow_versions")
-    .select("*")
-    .eq("id", versionId)
-    .single();
-  return data ?? null;
-}
-
-async function getConnectorAdapter(connector: string | undefined) {
-  if (!connector) return null;
-  const { data } = await supabase.functions.invoke("connector-registry", {
-    body: { connector },
-  });
-  return data?.adapter ?? null;
-}
-
-async function executeStep(job: any, node: any, adapter: any) {
-  const { error } = await supabase.functions.invoke("execute-step", {
-    body: {
-      run_id: job.run_id,
-      step_id: job.step_id,
-      job_id: job.id,
-      node,
-      adapter,
-      payload: job.payload,
-    },
-  });
-
-  if (error) throw new Error("step-execution-failed");
-}
-
-async function createDownstream(runId: string, version: any, stepId: string, outcome: string) {
-  const node = version.graph.nodes.find((n: any) => n.id === stepId);
-  if (!node) return;
-
-  let nextIds: string[] = [];
-  if (outcome === "success") nextIds = node.next ?? [];
-  if (outcome === "failure") nextIds = node.on_failure ?? [];
-  if (outcome === "approval") nextIds = node.on_approval ?? [];
-  if (outcome === "compensation") nextIds = node.on_compensation ?? [];
-
-  for (const nextId of nextIds) {
-    await supabase.rpc("ensure_downstream_job", {
-      p_run_id: runId,
-      p_step_id: nextId,
-    });
-  }
-}
-
-async function completeJob(jobId: string) {
-  await supabase.functions.invoke("job-lifecycle", {
-    body: { job_id: jobId, action: "complete" },
+async function emitEvent(run_id: string, step_id: string, type: string, details: any) {
+  await supabase.from("workflow_events").insert({
+    run_id,
+    step_id,
+    type,
+    details,
+    created_at: NOW(),
   });
 }
 
-async function failJob(jobId: string, reason: string) {
-  await supabase.functions.invoke("job-lifecycle", {
-    body: { job_id: jobId, action: "fail", error: reason },
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
   });
 }
 
-async function deadLetter(jobId: string, reason: string) {
-  await supabase.functions.invoke("dead-letter", {
-    body: { job_id: jobId, error: reason },
-  });
-}
-
-async function handleApproval(job: any, version: any) {
-  const { data: approval } = await supabase
-    .from("workflow_approvals")
-    .select("*")
-    .eq("run_id", job.run_id)
-    .eq("step_id", job.step_id)
-    .single();
-
-  // No approval yet → create pending + delay job
-  if (!approval) {
-    const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
-
-    await supabase.from("workflow_approvals").insert({
-      run_id: job.run_id,
-      step_id: job.step_id,
-      tenant_id: job.tenant_id,
-      state: "pending",
-      created_at: new Date(),
-      expires_at: expiresAt,
-    });
-
-    await supabase
-      .from("workflow_jobs")
-      .update({
-        state: "delayed",
-        scheduled_at: expiresAt,
-      })
-      .eq("id", job.id);
-
-    return { status: "delayed" };
-  }
-
-  // Expired?
-  if (
-    approval.state === "pending" &&
-    approval.expires_at &&
-    new Date(approval.expires_at) < new Date()
-  ) {
-    await supabase
-      .from("workflow_approvals")
-      .update({
-        state: "expired",
-        expired_at: new Date(),
-      })
-      .eq("id", approval.id);
-
-    await deadLetter(job.id, "approval-expired");
-    await createDownstream(job.run_id, version, job.step_id, "failure");
-
-    return { status: "dead" };
-  }
-
-  // Rejected?
-  if (approval.state === "rejected") {
-    await deadLetter(job.id, "approval-rejected");
-    await createDownstream(job.run_id, version, job.step_id, "failure");
-    return { status: "dead" };
-  }
-
-  // Pending → do not execute
-  if (approval.state === "pending") {
-    return { status: "delayed" };
-  }
-
-  // Approved → continue
-  return { status: "approved" };
-}
-
-async function processJob(job: any) {
-  const run = await loadRun(job.run_id);
-  if (!run) return await failJob(job.id, "run-not-found");
-
-  const version = await loadVersion(run.workflow_version_id);
-  if (!version) return await failJob(job.id, "version-not-found");
-
-  const node = version.graph.nodes.find((n: any) => n.id === job.step_id);
-  if (!node) return await deadLetter(job.id, "step-not-in-graph");
-
-  // Approval gate
-  if (node.type === "approval") {
-    const approvalStatus = await handleApproval(job, version);
-    if (approvalStatus.status !== "approved") return;
-  }
-
-  // Lease heartbeat
-  await renewLease(job.id);
-  let active = true;
-  const heartbeat = setInterval(() => {
-    if (active) renewLease(job.id);
-  }, HEARTBEAT_MS);
-
-  try {
-    const adapter = await getConnectorAdapter(node.connector);
-    if (node.connector && !adapter) throw new Error("connector-adapter-not-found");
-
-    await executeStep(job, node, adapter);
-
-    await completeJob(job.id);
-    await createDownstream(job.run_id, version, job.step_id, "success");
-  } catch (err) {
-    console.error("processJob error", err);
-
-    const nextAttempt = job.attempt + 1;
-
-    if (nextAttempt >= MAX_ATTEMPTS) {
-      await deadLetter(job.id, "max-attempts-exceeded");
-      await createDownstream(job.run_id, version, job.step_id, "failure");
-    } else {
-      await failJob(job.id, "execution-error");
-    }
-  } finally {
-    active = false;
-    clearInterval(heartbeat);
-  }
-}
-
-serve(async () => {
-  const job = await claimNextJob();
-
-  if (!job) {
-    return new Response(JSON.stringify({ status: "no-job" }), { status: 200 });
-  }
-
-  await processJob(job);
-
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      status: "processed",
-      job_id: job.id,
-      run_id: job.run_id,
-      step_id: job.step_id,
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
