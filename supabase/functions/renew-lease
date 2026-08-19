@@ -1,5 +1,5 @@
 // supabase/functions/renew-lease/index.ts
-// Valtaris Glue — Worker Lease Renewal Engine
+// Valtaris Glue — Worker Lease Renewal Engine (Generation 3)
 //
 // Durable execution requires lease renewal.
 // Workers must periodically extend their lease on claimed jobs.
@@ -26,35 +26,74 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
-const LEASE_MS = 1000 * 30; // 30 seconds
+// Lease duration (Generation‑3 standard)
+const LEASE_MS = 1000 * 60 * 2; // 2 minutes
 
 serve(async (req) => {
-  const body = await req.json();
-  const { worker_id } = body;
+  try {
+    const body = await req.json();
+    const { worker_id } = body;
 
-  if (!worker_id) {
-    return new Response("missing-worker-id", { status: 400 });
+    if (!worker_id) {
+      return jsonError("missing-worker-id", 400);
+    }
+
+    const newLease = new Date(Date.now() + LEASE_MS).toISOString();
+
+    // Renew leases for all jobs claimed by this worker
+    const { error } = await supabase
+      .from("workflow_jobs")
+      .update({
+        lease_expires_at: newLease,
+      })
+      .eq("claimed_by", worker_id)
+      .eq("state", "running");
+
+    if (error) {
+      console.error("lease-renewal-error:", error);
+      return jsonError("lease-renewal-failed", 500, error);
+    }
+
+    // Emit lease-renewal event
+    await supabase.from("workflow_events").insert({
+      run_id: null,
+      step_id: null,
+      type: "worker.lease.renewed",
+      details: { worker_id, renewed_until: newLease },
+      created_at: new Date(),
+    });
+
+    return jsonOK({
+      status: "lease-renewed",
+      worker_id,
+      renewed_until: newLease,
+    });
+  } catch (err) {
+    console.error("renew-lease fatal error:", err);
+    return jsonError("renew-lease-failed", 500, err);
   }
+});
 
-  // 1. Renew leases for all jobs claimed by this worker
-  const { error } = await supabase
-    .from("workflow_jobs")
-    .update({
-      lease_expires_at: new Date(Date.now() + LEASE_MS).toISOString(),
-    })
-    .eq("claimed_by", worker_id)
-    .eq("state", "running");
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
 
-  if (error) {
-    return new Response("lease-renewal-failed", { status: 500 });
-  }
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
+function jsonError(code: string, status = 500, details?: any) {
   return new Response(
     JSON.stringify({
-      worker_id,
-      renewed_until: new Date(Date.now() + LEASE_MS).toISOString(),
-      status: "ok",
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
