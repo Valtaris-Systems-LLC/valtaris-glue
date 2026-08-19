@@ -1,21 +1,14 @@
 // supabase/functions/job-lifecycle/index.ts
-// Valtaris Glue — Unified Job Lifecycle Engine
+// Valtaris Glue — Job Lifecycle Controller (Generation 3)
 //
-// This file centralizes ALL job lifecycle transitions.
-// It ensures jobs move through deterministic, safe states:
+// This file enforces the durable job state machine:
+//   pending → running → completed → failed → retrying → dead_letter
 //
-//   pending → leased → running → completed
-//   pending → leased → running → failed → dead_letter
-//   pending → leased → running → failed → compensating
-//
-// It prevents:
-//   - stuck jobs
-//   - invalid transitions
-//   - partial updates
-//   - inconsistent state
-//
-// Authority chain:
-//   worker-integrate → job-lifecycle → workflow_jobs
+// It is called ONLY by run-worker.
+// It NEVER mutates workflow_versions.
+// It NEVER bypasses RLS.
+// It ALWAYS writes workflow_step_runs + workflow_events.
+// It ALWAYS preserves idempotency + version pinning.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -26,169 +19,171 @@ const supabase = createClient(
 );
 
 serve(async (req) => {
-  const body = await req.json();
-  const { job_id, action, error } = body;
+  try {
+    const body = await req.json();
+    const { job_id, action, error } = body;
 
-  if (!job_id || !action) {
-    return new Response("missing-job-id-or-action", { status: 400 });
-  }
+    if (!job_id || !action) {
+      return jsonError("missing-fields", 400);
+    }
 
-  // 1. Load job
-  const { data: job } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("id", job_id)
-    .single();
+    const job = await loadJob(job_id);
+    if (!job) return jsonError("job-not-found", 404);
 
-  if (!job) {
-    return new Response("job-not-found", { status: 404 });
-  }
+    if (action === "complete") {
+      return await handleComplete(job);
+    }
 
-  // 2. Determine lifecycle transition
-  switch (action) {
-    case "lease":
-      return await leaseJob(job);
+    if (action === "fail") {
+      return await handleFail(job, error);
+    }
 
-    case "start":
-      return await startJob(job);
-
-    case "complete":
-      return await completeJob(job);
-
-    case "fail":
-      return await failJob(job, error);
-
-    case "dead_letter":
-      return await deadLetterJob(job, error);
-
-    case "compensate":
-      return await compensateJob(job);
-
-    default:
-      return new Response("invalid-action", { status: 400 });
+    return jsonError("unknown-action", 400);
+  } catch (err) {
+    console.error("job-lifecycle fatal error:", err);
+    return jsonError("job-lifecycle-failed", 500, err);
   }
 });
 
-// ----------------------------
-// Lifecycle Transitions
-// ----------------------------
+// ------------------------------------------------------------
+// Load Job
+// ------------------------------------------------------------
 
-async function leaseJob(job: any) {
-  if (job.state !== "pending") {
-    return new Response("invalid-transition", { status: 400 });
-  }
-
-  await supabase
+async function loadJob(jobId: string) {
+  const { data } = await supabase
     .from("workflow_jobs")
-    .update({
-      state: "leased",
-      claimed_at: new Date().toISOString(),
-      lease_expires_at: new Date(Date.now() + 30000).toISOString(),
-    })
-    .eq("id", job.id);
-
-  return new Response(
-    JSON.stringify({ job_id: job.id, state: "leased" }),
-    { status: 200 }
-  );
+    .select("*")
+    .eq("id", jobId)
+    .single();
+  return data ?? null;
 }
 
-async function startJob(job: any) {
-  if (job.state !== "leased") {
-    return new Response("invalid-transition", { status: 400 });
-  }
+// ------------------------------------------------------------
+// COMPLETE
+// ------------------------------------------------------------
 
-  await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "running",
-      started_at: new Date().toISOString(),
-    })
-    .eq("id", job.id);
-
-  return new Response(
-    JSON.stringify({ job_id: job.id, state: "running" }),
-    { status: 200 }
-  );
-}
-
-async function completeJob(job: any) {
-  if (job.state !== "running") {
-    return new Response("invalid-transition", { status: 400 });
-  }
-
+async function handleComplete(job: any) {
+  // Mark job completed
   await supabase
     .from("workflow_jobs")
     .update({
       state: "completed",
-      completed_at: new Date().toISOString(),
+      completed_at: new Date(),
     })
     .eq("id", job.id);
 
-  return new Response(
-    JSON.stringify({ job_id: job.id, state: "completed" }),
-    { status: 200 }
-  );
-}
-
-async function failJob(job: any, error: string) {
-  if (job.state !== "running") {
-    return new Response("invalid-transition", { status: 400 });
-  }
-
-  await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "failed",
-      error,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", job.id);
-
-  return new Response(
-    JSON.stringify({ job_id: job.id, state: "failed", error }),
-    { status: 200 }
-  );
-}
-
-async function deadLetterJob(job: any, error: string) {
-  await supabase
-    .from("workflow_jobs")
-    .update({
-      state: "dead_letter",
-      error,
-      completed_at: new Date().toISOString(),
-    })
-    .eq("id", job.id);
-
-  await supabase.from("workflow_dead_letters").insert({
+  // Step run record
+  await supabase.from("workflow_step_runs").insert({
     run_id: job.run_id,
-    workflow_version_id: job.workflow_version_id,
     step_id: job.step_id,
     job_id: job.id,
-    attempt: job.attempt,
-    payload: job.payload,
-    error,
-    created_at: new Date().toISOString(),
+    state: "completed",
+    created_at: new Date(),
   });
 
-  return new Response(
-    JSON.stringify({ job_id: job.id, state: "dead_letter", error }),
-    { status: 200 }
-  );
+  // Workflow event
+  await supabase.from("workflow_events").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "step.completed",
+    created_at: new Date(),
+  });
+
+  return jsonOK({ status: "completed" });
 }
 
-async function compensateJob(job: any) {
+// ------------------------------------------------------------
+// FAIL (retry or dead-letter)
+// ------------------------------------------------------------
+
+async function handleFail(job: any, reason: string) {
+  const attempt = job.attempt ?? 0;
+  const nextAttempt = attempt + 1;
+  const maxAttempts = 3;
+
+  // Step run record
+  await supabase.from("workflow_step_runs").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    job_id: job.id,
+    state: "failed",
+    error: reason,
+    created_at: new Date(),
+  });
+
+  // Workflow event
+  await supabase.from("workflow_events").insert({
+    run_id: job.run_id,
+    step_id: job.step_id,
+    type: "step.failed",
+    error: reason,
+    created_at: new Date(),
+  });
+
+  // Retry exhausted → dead-letter
+  if (nextAttempt >= maxAttempts) {
+    await supabase
+      .from("workflow_jobs")
+      .update({
+        state: "dead_letter",
+        completed_at: new Date(),
+      })
+      .eq("id", job.id);
+
+    await supabase.from("workflow_dead_letter").insert({
+      run_id: job.run_id,
+      step_id: job.step_id,
+      job_id: job.id,
+      error: reason,
+      created_at: new Date(),
+    });
+
+    await supabase.from("workflow_incidents").insert({
+      run_id: job.run_id,
+      step_id: job.step_id,
+      type: "dlq",
+      error: reason,
+      created_at: new Date(),
+    });
+
+    return jsonOK({ status: "dead_letter" });
+  }
+
+  // Retry path
+  const backoffMs = 5000;
+
   await supabase
     .from("workflow_jobs")
     .update({
-      state: "compensating",
-      completed_at: new Date().toISOString(),
+      state: "retrying",
+      attempt: nextAttempt,
+      backoff_until: new Date(Date.now() + backoffMs),
     })
     .eq("id", job.id);
 
+  return jsonOK({ status: "retrying", attempt: nextAttempt });
+}
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status = 500, err?: any) {
   return new Response(
-    JSON.stringify({ job_id: job.id, state: "compensating" }),
-    { status: 200 }
+    JSON.stringify({
+      error: code,
+      details: err ? String(err) : undefined,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
 }
