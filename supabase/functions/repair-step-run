@@ -1,0 +1,163 @@
+// supabase/functions/repair-step-run/index.ts
+// Valtaris Glue — Step-Run Repair Engine (Generation 3)
+//
+// Responsibilities:
+//   - Detect stuck step-runs (running too long)
+//   - Detect step-runs whose worker crashed mid-execution
+//   - Detect step-runs whose job is already terminal
+//   - Detect step-runs belonging to invalid DAG nodes
+//   - Reset step-run state safely
+//   - Requeue job if needed
+//   - Preserve provenance
+//
+// Contract:
+//   - Does NOT execute connectors
+//   - Does NOT mutate workflow_versions
+//   - Must be idempotent
+//   - Called by check-invariants, stuck-run-detector, SLA sweeper
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const NOW = () => new Date();
+const STEP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+serve(async (req) => {
+  const body = await req.json().catch(() => ({}));
+  const { step_run_id } = body;
+
+  if (!step_run_id) {
+    return new Response("missing-step-run-id", { status: 400 });
+  }
+
+  // 1. Load step-run
+  const { data: stepData, error: stepError } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("id", step_run_id)
+    .single();
+
+  if (stepError || !stepData) {
+    return new Response("step-run-not-found", { status: 404 });
+  }
+
+  const step = stepData;
+
+  // 2. Load job
+  const { data: jobData } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("step_id", step.step_id)
+    .eq("run_id", step.run_id)
+    .single();
+
+  const job = jobData ?? null;
+
+  // 3. Detect stuck step-run
+  const now = Date.now();
+  const stepIsStuck =
+    step.state === "running" &&
+    now - new Date(step.created_at).getTime() > STEP_TIMEOUT_MS;
+
+  // 4. Detect job already terminal
+  const jobTerminal =
+    job && (job.state === "completed" || job.state === "failed");
+
+  // 5. Detect invalid DAG node
+  const version = await loadVersion(step.workflow_version_id);
+  const graph = version.graph;
+  const nodeIds = new Set(graph.nodes.map((n: any) => n.id));
+  const invalidNode = !nodeIds.has(step.step_id);
+
+  if (!stepIsStuck && !jobTerminal && !invalidNode) {
+    return new Response(
+      JSON.stringify({
+        status: "step-run-not-stuck",
+        step_run_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 6. Reset step-run
+  const { error: resetError } = await supabase
+    .from("workflow_step_runs")
+    .update({
+      state: "pending",
+      error: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", step_run_id);
+
+  if (resetError) {
+    console.error("reset-step-run-error", resetError);
+    return new Response("step-run-reset-failed", { status: 500 });
+  }
+
+  // 7. Record provenance
+  await supabase
+    .from("workflow_step_run_repair")
+    .insert({
+      step_run_id,
+      run_id: step.run_id,
+      step_id: step.step_id,
+      reason: stepIsStuck
+        ? "step-stuck"
+        : jobTerminal
+        ? "job-terminal"
+        : "invalid-node",
+      repaired_at: new Date().toISOString(),
+    })
+    .catch(() => {});
+
+  // 8. Requeue job if needed
+  if (job && job.state !== "pending") {
+    await supabase
+      .from("workflow_jobs")
+      .update({
+        state: "pending",
+        claimed_at: null,
+        lease_expires_at: null,
+        error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job.id);
+
+    await supabase.functions.invoke("schedule-next-job", {
+      body: { run_id: step.run_id },
+    });
+  }
+
+  return new Response(
+    JSON.stringify({
+      status: "step-run-repaired",
+      step_run_id,
+      run_id: step.run_id,
+      step_id: step.step_id,
+      reason: stepIsStuck
+        ? "step-stuck"
+        : jobTerminal
+        ? "job-terminal"
+        : "invalid-node",
+    }),
+    { status: 200 }
+  );
+});
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", versionId)
+    .single();
+  return data ?? null;
+}
