@@ -1,22 +1,23 @@
-// supabase/functions/check-invariants/index.ts
-// Valtaris Glue — Runtime Invariant Checker (Generation 3)
+// supabase/functions/audit-run/index.ts
+// Valtaris Glue — Workflow Run Consistency Audit (Generation 3)
 //
-// This file enforces Glue's core invariants.
-// If any invariant is violated, Glue repairs the state.
-//
-// Invariants enforced:
-// 1. Every job must have a matching step-run.
-// 2. Every step-run must belong to a valid graph node.
-// 3. A run cannot be "completed" if any job is not completed.
-// 4. A run cannot be "running" if all jobs are terminal.
-// 5. A job cannot be "running" if its step-run is terminal.
-// 6. A step-run cannot be "completed" if its job is not completed.
-// 7. A run cannot be "failed" if compensation is enabled and not executed.
-// 8. No job may remain leased past its lease expiration.
-// 9. No step-run may remain "running" past worker-timeout.
+// This file is responsible for:
+//   - validating workflow run consistency
+//   - validating step history correctness
+//   - validating job history correctness
+//   - validating DAG completeness
+//   - validating terminal state correctness
+//   - emitting audit events
+//   - producing a clean audit record for replay + observability
 //
 // Authority chain:
-// check-invariants → repair-engines → lifecycle-engines → finalization
+// finalize-run → audit-run → replay-workflow (optional)
+//
+// This file NEVER:
+//   - executes connectors
+//   - creates jobs
+//   - mutates workflow_versions
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -27,9 +28,6 @@ const supabase = createClient(
 );
 
 const NOW = () => new Date();
-const NOW_ISO = () => new Date().toISOString();
-
-const WORKER_TIMEOUT_MS = 1000 * 60 * 10; // 10 minutes
 
 serve(async (req) => {
   try {
@@ -40,36 +38,47 @@ serve(async (req) => {
       return jsonError("missing-run-id", 400);
     }
 
-    // 1. Load run
     const run = await loadRun(run_id);
     if (!run) return jsonError("run-not-found", 404);
 
-    // 2. Load version + graph
     const version = await loadVersion(run.workflow_version_id);
-    const graph = version.graph;
+    if (!version) return jsonError("version-not-found", 404);
 
-    // 3. Load jobs + step-runs
-    const jobs = await loadJobs(run_id);
     const steps = await loadStepRuns(run_id);
+    const jobs = await loadJobs(run_id);
 
-    // Run all invariants
-    await invariantJobsHaveStepRuns(run_id, jobs, steps);
-    await invariantStepRunsValid(run_id, steps, graph);
-    await invariantRunCompletedOnlyIfAllJobsCompleted(run_id, run, jobs);
-    await invariantRunRunningOnlyIfJobsActive(run_id, run, jobs);
-    await invariantJobRunningOnlyIfStepActive(run_id, jobs, steps);
-    await invariantStepCompletedOnlyIfJobCompleted(run_id, jobs, steps);
-    await invariantRunFailedOnlyIfCompensationDone(run_id, run, steps, graph);
-    await invariantNoExpiredLeases(run_id, jobs);
-    await invariantNoStuckStepRuns(run_id, steps);
+    const audit = {
+      run_id,
+      terminal_state: run.state,
+      step_count: steps.length,
+      job_count: jobs.length,
+      step_state_summary: summarizeStepStates(steps),
+      job_state_summary: summarizeJobStates(jobs),
+      dag_completeness: checkDagCompleteness(version, steps),
+      terminal_state_valid: checkTerminalState(run, steps),
+      created_at: NOW(),
+    };
+
+    // Emit audit event
+    await supabase.from("workflow_events").insert({
+      run_id,
+      step_id: null,
+      type: "run.audit.completed",
+      details: audit,
+      created_at: NOW(),
+    });
+
+    // Store audit record
+    await supabase.from("workflow_run_audits").insert(audit);
 
     return jsonOK({
-      status: "invariants-checked",
+      status: "audit-complete",
       run_id,
+      audit,
     });
   } catch (err) {
-    console.error("check-invariants fatal error:", err);
-    return jsonError("check-invariants-failed", 500, err);
+    console.error("audit-run fatal error:", err);
+    return jsonError("audit-run-failed", 500, err);
   }
 });
 
@@ -95,14 +104,6 @@ async function loadVersion(versionId: string) {
   return data ?? null;
 }
 
-async function loadJobs(runId: string) {
-  const { data } = await supabase
-    .from("workflow_jobs")
-    .select("*")
-    .eq("run_id", runId);
-  return data ?? [];
-}
-
 async function loadStepRuns(runId: string) {
   const { data } = await supabase
     .from("workflow_step_runs")
@@ -111,120 +112,67 @@ async function loadStepRuns(runId: string) {
   return data ?? [];
 }
 
-// ------------------------------------------------------------
-// Invariants
-// ------------------------------------------------------------
-
-async function invariantJobsHaveStepRuns(run_id: string, jobs: any[], steps: any[]) {
-  const stepIds = new Set(steps.map((s) => s.step_id));
-
-  for (const job of jobs) {
-    if (!stepIds.has(job.step_id)) {
-      await repair("missing-step-run", { run_id, job_id: job.id });
-    }
-  }
+async function loadJobs(runId: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("run_id", runId);
+  return data ?? [];
 }
 
-async function invariantStepRunsValid(run_id: string, steps: any[], graph: any) {
-  const validIds = new Set(graph.nodes.map((n: any) => n.id));
+// ------------------------------------------------------------
+// Summaries
+// ------------------------------------------------------------
 
-  for (const step of steps) {
-    if (!validIds.has(step.step_id)) {
-      await repair("invalid-step-run", { run_id, step_id: step.step_id });
-    }
+function summarizeStepStates(steps: any[]) {
+  const summary: Record<string, number> = {};
+  for (const s of steps) {
+    summary[s.state] = (summary[s.state] ?? 0) + 1;
   }
+  return summary;
 }
 
-async function invariantRunCompletedOnlyIfAllJobsCompleted(run_id: string, run: any, jobs: any[]) {
+function summarizeJobStates(jobs: any[]) {
+  const summary: Record<string, number> = {};
+  for (const j of jobs) {
+    summary[j.state] = (summary[j.state] ?? 0) + 1;
+  }
+  return summary;
+}
+
+// ------------------------------------------------------------
+// DAG Completeness
+// ------------------------------------------------------------
+
+function checkDagCompleteness(version: any, steps: any[]) {
+  const nodeIds = new Set(version.graph.nodes.map((n: any) => n.id));
+  const completedSteps = new Set(steps.map((s: any) => s.step_id));
+
+  const missing = [...nodeIds].filter((id) => !completedSteps.has(id));
+
+  return {
+    complete: missing.length === 0,
+    missing_steps: missing,
+  };
+}
+
+// ------------------------------------------------------------
+// Terminal State Validation
+// ------------------------------------------------------------
+
+function checkTerminalState(run: any, steps: any[]) {
+  const failed = steps.some((s) => s.state === "failed");
+  const completed = steps.every((s) => s.state === "completed");
+
   if (run.state === "completed") {
-    const allCompleted = jobs.every((j) => j.state === "completed");
-    if (!allCompleted) {
-      await repair("run-completed-with-active-jobs", { run_id });
-    }
+    return completed;
   }
-}
 
-async function invariantRunRunningOnlyIfJobsActive(run_id: string, run: any, jobs: any[]) {
-  if (run.state === "running") {
-    const anyActive = jobs.some((j) =>
-      ["pending", "running", "retrying", "delayed"].includes(j.state)
-    );
-    if (!anyActive) {
-      await repair("run-running-with-no-active-jobs", { run_id });
-    }
+  if (run.state === "failed") {
+    return failed;
   }
-}
 
-async function invariantJobRunningOnlyIfStepActive(run_id: string, jobs: any[], steps: any[]) {
-  const stepMap = new Map(steps.map((s) => [s.step_id, s.state]));
-
-  for (const job of jobs) {
-    if (job.state === "running") {
-      const stepState = stepMap.get(job.step_id);
-      if (["completed", "failed", "compensated", "approved", "rejected"].includes(stepState)) {
-        await repair("job-running-with-terminal-step", { run_id, job_id: job.id });
-      }
-    }
-  }
-}
-
-async function invariantStepCompletedOnlyIfJobCompleted(run_id: string, jobs: any[], steps: any[]) {
-  const jobMap = new Map(jobs.map((j) => [j.step_id, j.state]));
-
-  for (const step of steps) {
-    if (step.state === "completed") {
-      const jobState = jobMap.get(step.step_id);
-      if (jobState !== "completed") {
-        await repair("step-completed-with-noncompleted-job", { run_id, step_id: step.step_id });
-      }
-    }
-  }
-}
-
-async function invariantRunFailedOnlyIfCompensationDone(run_id: string, run: any, steps: any[], graph: any) {
-  if (run.state !== "failed") return;
-
-  const compNodes = graph.nodes.filter((n: any) => n.type === "compensation");
-  const compIds = new Set(compNodes.map((n: any) => n.id));
-
-  const compensated = new Set(
-    steps.filter((s) => s.state === "compensated").map((s) => s.step_id)
-  );
-
-  for (const id of compIds) {
-    if (!compensated.has(id)) {
-      await repair("run-failed-without-compensation", { run_id });
-    }
-  }
-}
-
-async function invariantNoExpiredLeases(run_id: string, jobs: any[]) {
-  for (const job of jobs) {
-    if (job.state === "running" && job.lease_expires_at < NOW_ISO()) {
-      await repair("expired-lease", { run_id, job_id: job.id });
-    }
-  }
-}
-
-async function invariantNoStuckStepRuns(run_id: string, steps: any[]) {
-  for (const step of steps) {
-    if (step.state === "running") {
-      const age = NOW().getTime() - new Date(step.created_at).getTime();
-      if (age > WORKER_TIMEOUT_MS) {
-        await repair("step-run-timeout", { run_id, step_id: step.step_id });
-      }
-    }
-  }
-}
-
-// ------------------------------------------------------------
-// Repair Dispatcher
-// ------------------------------------------------------------
-
-async function repair(type: string, payload: any) {
-  await supabase.functions.invoke("repair-run", {
-    body: { type, ...payload },
-  });
+  return false;
 }
 
 // ------------------------------------------------------------
