@@ -1,0 +1,138 @@
+// supabase/functions/repair-run-state/index.ts
+// Valtaris Glue — Run State Repair Engine (Generation 3)
+//
+// Responsibilities:
+//   - Fix incorrect run terminal states
+//   - Fix runs marked completed when jobs are not
+//   - Fix runs marked failed when no failure occurred
+//   - Fix runs marked running when all jobs are terminal
+//   - Reconcile run state with job + step states
+//   - Preserve provenance
+//
+// Contract:
+//   - Does NOT execute connectors
+//   - Does NOT mutate workflow_versions
+//   - Must be idempotent
+//   - Called by check-invariants, stuck-run-detector, lifecycle engines
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const NOW = () => new Date();
+
+serve(async (req) => {
+  const body = await req.json().catch(() => ({}));
+  const { run_id } = body;
+
+  if (!run_id) {
+    return new Response("missing-run-id", { status: 400 });
+  }
+
+  // 1. Load run
+  const { data: runData, error: runError } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (runError || !runData) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  const run = runData;
+
+  // 2. Load jobs + step-runs
+  const jobs = await loadJobs(run_id);
+  const steps = await loadSteps(run_id);
+
+  const allJobsCompleted = jobs.every((j) => j.state === "completed");
+  const anyJobFailed = jobs.some((j) => j.state === "failed");
+  const allJobsTerminal = jobs.every(
+    (j) => j.state === "completed" || j.state === "failed"
+  );
+
+  // 3. Determine correct run state
+  let correctState = run.state;
+
+  if (anyJobFailed) {
+    correctState = "failed";
+  } else if (allJobsCompleted) {
+    correctState = "completed";
+  } else if (allJobsTerminal) {
+    correctState = "completed";
+  } else {
+    correctState = "running";
+  }
+
+  // 4. If state is already correct, exit
+  if (correctState === run.state) {
+    return new Response(
+      JSON.stringify({
+        status: "run-state-correct",
+        run_id,
+        state: run.state,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 5. Update run state
+  const { error: updateError } = await supabase
+    .from("workflow_runs")
+    .update({
+      state: correctState,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", run_id);
+
+  if (updateError) {
+    console.error("run-state-update-error", updateError);
+    return new Response("run-state-update-failed", { status: 500 });
+  }
+
+  // 6. Record provenance
+  await supabase
+    .from("workflow_run_state_repair")
+    .insert({
+      run_id,
+      old_state: run.state,
+      new_state: correctState,
+      repaired_at: new Date().toISOString(),
+    })
+    .catch(() => {});
+
+  return new Response(
+    JSON.stringify({
+      status: "run-state-repaired",
+      run_id,
+      old_state: run.state,
+      new_state: correctState,
+    }),
+    { status: 200 }
+  );
+});
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadJobs(run_id: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("run_id", run_id);
+  return data ?? [];
+}
+
+async function loadSteps(run_id: string) {
+  const { data } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", run_id);
+  return data ?? [];
+}
