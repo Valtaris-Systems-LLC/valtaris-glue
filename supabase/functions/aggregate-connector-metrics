@@ -1,18 +1,23 @@
 // supabase/functions/aggregate-connector-metrics/index.ts
-// Valtaris Glue — Connector Metrics Aggregator
+// Valtaris Glue — Connector Metrics Aggregator (Generation 3)
 //
-// This file aggregates metrics at the connector level.
-// It produces analytics such as:
-//   - connector latency
-//   - connector throughput
-//   - connector error rate
-//   - connector DLQ frequency
-//   - connector retry frequency
-//   - connector compensation frequency
+// This file aggregates raw connector metrics into:
+//   - avg latency
+//   - p95 latency
+//   - error rate
+//   - success rate
+//   - call volume
 //   - reliability score
 //
 // Authority chain:
-//   collect-metrics → aggregate-connector-metrics → dashboards
+//   collect-metrics → aggregate-connector-metrics → workflow_connector_aggregates
+//
+// This file NEVER:
+//   - mutates workflow_runs
+//   - mutates workflow_versions
+//   - executes connectors
+//   - schedules jobs
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -22,75 +27,144 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date().toISOString();
+
+// ------------------------------------------------------------
+// Aggregation Window
+// ------------------------------------------------------------
+
+const WINDOW_MINUTES = 5; // 5‑minute rolling window
+
+function windowStart() {
+  return new Date(Date.now() - WINDOW_MINUTES * 60 * 1000).toISOString();
+}
+
+// ------------------------------------------------------------
+// Main Handler
+// ------------------------------------------------------------
+
 serve(async () => {
-  // 1. Load raw metrics
-  const { data: metrics } = await supabase
-    .from("workflow_metrics")
-    .select("*");
+  try {
+    const start = windowStart();
 
-  // 2. Group metrics by connector
-  const connectors = new Map();
+    // Load raw metrics for the window
+    const { data: metrics, error } = await supabase
+      .from("workflow_metrics")
+      .select("*")
+      .eq("event", "connector.execution")
+      .gte("created_at", start);
 
-  for (const m of metrics) {
-    if (!m.connector) continue;
-
-    if (!connectors.has(m.connector)) {
-      connectors.set(m.connector, []);
+    if (error) {
+      return jsonError("load-metrics-failed", 500, error);
     }
 
-    connectors.get(m.connector).push(m);
-  }
+    if (!metrics || metrics.length === 0) {
+      return jsonOK({
+        status: "no-metrics",
+        window_start: start,
+      });
+    }
 
-  const aggregates = [];
+    // Group by connector
+    const grouped: Record<string, any[]> = {};
+    for (const m of metrics) {
+      const key = m.connector ?? "unknown";
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(m);
+    }
 
-  // 3. Aggregate connector metrics
-  for (const [connector, events] of connectors.entries()) {
-    const durations = events
-      .filter((e: any) => e.duration_ms)
-      .map((e: any) => e.duration_ms);
+    // Aggregate each connector
+    const aggregates = [];
+    for (const connector of Object.keys(grouped)) {
+      const rows = grouped[connector];
 
-    const avgLatency =
-      durations.length > 0
-        ? durations.reduce((a: number, b: number) => a + b, 0) /
-          durations.length
-        : 0;
+      const durations = rows
+        .map((r) => r.duration_ms)
+        .filter((d) => typeof d === "number");
 
-    const errorCount = events.filter((e: any) => e.error).length;
-    const dlqCount = events.filter((e: any) => e.event === "dlq").length;
-    const retryCount = events.filter((e: any) => e.event === "retry").length;
-    const compensationCount = events.filter(
-      (e: any) => e.event === "compensate"
-    ).length;
+      const errors = rows.filter((r) => r.error);
+      const successes = rows.filter((r) => !r.error);
 
-    const throughput = events.length;
+      const avgLatency =
+        durations.length > 0
+          ? durations.reduce((a, b) => a + b, 0) / durations.length
+          : null;
 
-    // Reliability score (simple heuristic)
-    const reliability =
-      throughput === 0
-        ? 1
-        : 1 - (errorCount + dlqCount + retryCount) / throughput;
+      const p95Latency =
+        durations.length > 0
+          ? percentile(durations, 95)
+          : null;
 
-    aggregates.push({
-      connector,
-      avg_latency_ms: avgLatency,
-      throughput,
-      error_count: errorCount,
-      dlq_count: dlqCount,
-      retry_count: retryCount,
-      compensation_count: compensationCount,
-      reliability_score: reliability,
-      created_at: new Date().toISOString(),
+      const errorRate = rows.length > 0 ? errors.length / rows.length : 0;
+      const successRate = rows.length > 0 ? successes.length / rows.length : 0;
+
+      const reliabilityScore = computeReliability(successRate, p95Latency);
+
+      aggregates.push({
+        connector,
+        window_start: start,
+        window_end: NOW(),
+        call_count: rows.length,
+        avg_latency_ms: avgLatency,
+        p95_latency_ms: p95Latency,
+        error_rate,
+        success_rate,
+        reliability_score: reliabilityScore,
+        created_at: NOW(),
+      });
+    }
+
+    // Insert aggregates
+    const { error: insertErr } = await supabase
+      .from("workflow_connector_aggregates")
+      .insert(aggregates);
+
+    if (insertErr) {
+      return jsonError("insert-aggregates-failed", 500, insertErr);
+    }
+
+    return jsonOK({
+      status: "aggregated",
+      window_start: start,
+      connectors: aggregates.length,
     });
+  } catch (err) {
+    return jsonError("aggregate-connector-metrics-failed", 500, String(err));
   }
+});
 
-  // 4. Store aggregated metrics
-  await supabase.from("workflow_connector_metrics").insert(aggregates);
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
+function percentile(arr: number[], p: number) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
+
+function computeReliability(successRate: number, p95Latency: number | null) {
+  if (p95Latency === null) return successRate;
+  const latencyPenalty = Math.min(p95Latency / 5000, 1); // 5s cap
+  return Math.max(0, successRate - latencyPenalty);
+}
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status: number, details?: any) {
   return new Response(
     JSON.stringify({
-      status: "connector-metrics-aggregated",
-      connectors: aggregates.length,
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
