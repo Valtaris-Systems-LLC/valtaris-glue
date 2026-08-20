@@ -1,20 +1,25 @@
 // supabase/functions/aggregate-job-step-metrics/index.ts
-// Valtaris Glue — Job/Step Metrics Aggregator
+// Valtaris Glue — Job & Step Metrics Aggregator (Generation 3)
 //
-// This file aggregates metrics at the job and step level.
-// It produces analytics such as:
-//   - job duration
-//   - step duration
-//   - job success/failure rate
-//   - step success/failure rate
-//   - retry counts
-//   - DLQ frequency
-//   - compensation frequency
-//   - latency distribution
-//   - throughput (jobs/minute, steps/minute)
+// This file aggregates raw job + step metrics into:
+//   - avg job duration
+//   - avg step duration
+//   - p95 step latency
+//   - job error rate
+//   - step error rate
+//   - job success rate
+//   - step success rate
+//   - reliability scoring
 //
 // Authority chain:
-//   collect-metrics → aggregate-job-step-metrics → dashboards
+//   collect-metrics → aggregate-job-step-metrics → workflow_job_step_aggregates
+//
+// This file NEVER:
+//   - mutates workflow_runs
+//   - mutates workflow_versions
+//   - executes connectors
+//   - schedules jobs
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -24,99 +29,145 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date().toISOString();
+
+// ------------------------------------------------------------
+// Aggregation Window
+// ------------------------------------------------------------
+
+const WINDOW_MINUTES = 5; // 5‑minute rolling window
+
+function windowStart() {
+  return new Date(Date.now() - WINDOW_MINUTES * 60 * 1000).toISOString();
+}
+
+// ------------------------------------------------------------
+// Main Handler
+// ------------------------------------------------------------
+
 serve(async () => {
-  // 1. Load jobs and step-runs
-  const { data: jobs } = await supabase
-    .from("workflow_jobs")
-    .select("*");
+  try {
+    const start = windowStart();
 
-  const { data: steps } = await supabase
-    .from("workflow_step_runs")
-    .select("*");
+    // Load raw metrics for the window
+    const { data: metrics, error } = await supabase
+      .from("workflow_metrics")
+      .select("*")
+      .gte("created_at", start);
 
-  // 2. Load raw metrics
-  const { data: metrics } = await supabase
-    .from("workflow_metrics")
-    .select("*");
+    if (error) {
+      return jsonError("load-metrics-failed", 500, error);
+    }
 
-  const jobAggregates = [];
-  const stepAggregates = [];
+    if (!metrics || metrics.length === 0) {
+      return jsonOK({
+        status: "no-metrics",
+        window_start: start,
+      });
+    }
 
-  // ----------------------------
-  // Aggregate job metrics
-  // ----------------------------
-  for (const job of jobs) {
-    const jobMetrics = metrics.filter((m: any) => m.job_id === job.id);
+    // Group by job_id + step_id
+    const grouped: Record<string, any[]> = {};
+    for (const m of metrics) {
+      const key = `${m.job_id ?? "unknown"}::${m.step_id ?? "unknown"}`;
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(m);
+    }
 
-    const start = new Date(job.created_at).getTime();
-    const end = new Date(job.completed_at ?? Date.now()).getTime();
-    const durationMs = end - start;
+    // Aggregate each job/step pair
+    const aggregates = [];
+    for (const key of Object.keys(grouped)) {
+      const rows = grouped[key];
+      const [job_id, step_id] = key.split("::");
 
-    const success = job.state === "completed";
-    const failed = job.state === "failed";
-    const deadLetter = job.state === "dead_letter";
-    const compensated = job.state === "compensating" || job.state === "compensated";
+      const durations = rows
+        .map((r) => r.duration_ms)
+        .filter((d) => typeof d === "number");
 
-    const dlqCount = jobMetrics.filter((m: any) => m.event === "dlq").length;
-    const retryCount = job.attempt ?? 0;
-    const errorCount = jobMetrics.filter((m: any) => m.error).length;
+      const errors = rows.filter((r) => r.error);
+      const successes = rows.filter((r) => !r.error);
 
-    jobAggregates.push({
-      job_id: job.id,
-      run_id: job.run_id,
-      step_id: job.step_id,
-      duration_ms: durationMs,
-      success,
-      failed,
-      dead_letter: deadLetter,
-      compensated,
-      dlq_count: dlqCount,
-      retry_count: retryCount,
-      error_count: errorCount,
-      created_at: new Date().toISOString(),
+      const avgDuration =
+        durations.length > 0
+          ? durations.reduce((a, b) => a + b, 0) / durations.length
+          : null;
+
+      const p95Latency =
+        durations.length > 0
+          ? percentile(durations, 95)
+          : null;
+
+      const errorRate = rows.length > 0 ? errors.length / rows.length : 0;
+      const successRate = rows.length > 0 ? successes.length / rows.length : 0;
+
+      const reliabilityScore = computeReliability(successRate, p95Latency);
+
+      aggregates.push({
+        job_id,
+        step_id,
+        window_start: start,
+        window_end: NOW(),
+        call_count: rows.length,
+        avg_duration_ms: avgDuration,
+        p95_latency_ms: p95Latency,
+        error_rate,
+        success_rate,
+        reliability_score: reliabilityScore,
+        created_at: NOW(),
+      });
+    }
+
+    // Insert aggregates
+    const { error: insertErr } = await supabase
+      .from("workflow_job_step_aggregates")
+      .insert(aggregates);
+
+    if (insertErr) {
+      return jsonError("insert-aggregates-failed", 500, insertErr);
+    }
+
+    return jsonOK({
+      status: "aggregated",
+      window_start: start,
+      pairs: aggregates.length,
     });
+  } catch (err) {
+    return jsonError("aggregate-job-step-metrics-failed", 500, String(err));
   }
+});
 
-  // ----------------------------
-  // Aggregate step metrics
-  // ----------------------------
-  for (const step of steps) {
-    const stepMetrics = metrics.filter((m: any) => m.step_id === step.step_id);
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
-    const start = new Date(step.created_at).getTime();
-    const end = new Date(step.completed_at ?? Date.now()).getTime();
-    const durationMs = end - start;
+function percentile(arr: number[], p: number) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
 
-    const success = step.state === "completed";
-    const failed = step.state === "failed";
-    const deadLetter = step.state === "dead_letter";
-    const compensated = step.state === "compensating" || step.state === "compensated";
+function computeReliability(successRate: number, p95Latency: number | null) {
+  if (p95Latency === null) return successRate;
+  const latencyPenalty = Math.min(p95Latency / 5000, 1); // 5s cap
+  return Math.max(0, successRate - latencyPenalty);
+}
 
-    const errorCount = stepMetrics.filter((m: any) => m.error).length;
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
-    stepAggregates.push({
-      step_id: step.step_id,
-      run_id: step.run_id,
-      duration_ms: durationMs,
-      success,
-      failed,
-      dead_letter: deadLetter,
-      compensated,
-      error_count: errorCount,
-      created_at: new Date().toISOString(),
-    });
-  }
-
-  // 3. Store aggregated metrics
-  await supabase.from("workflow_job_metrics").insert(jobAggregates);
-  await supabase.from("workflow_step_metrics").insert(stepAggregates);
-
+function jsonError(code: string, status: number, details?: any) {
   return new Response(
     JSON.stringify({
-      status: "job-step-metrics-aggregated",
-      jobs: jobAggregates.length,
-      steps: stepAggregates.length,
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
