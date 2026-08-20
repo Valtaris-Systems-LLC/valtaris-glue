@@ -1,0 +1,215 @@
+// supabase/functions/repair-compensation/index.ts
+// Valtaris Glue — Compensation Repair Engine (Generation 3)
+//
+// Responsibilities:
+//   - Detect incomplete compensation flows
+//   - Detect stuck compensation steps
+//   - Detect compensation steps whose worker crashed
+//   - Detect compensation steps belonging to invalid DAG nodes
+//   - Reset compensation steps safely
+//   - Requeue compensation jobs
+//   - Preserve provenance
+//
+// Contract:
+//   - Does NOT execute connectors
+//   - Does NOT mutate workflow_versions
+//   - Must be idempotent
+//   - Called by check-invariants, repair-run, lifecycle engines
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+);
+
+const NOW = () => new Date();
+const COMP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+serve(async (req) => {
+  const body = await req.json().catch(() => ({}));
+  const { run_id } = body;
+
+  if (!run_id) {
+    return new Response("missing-run-id", { status: 400 });
+  }
+
+  // 1. Load run
+  const { data: runData, error: runError } = await supabase
+    .from("workflow_runs")
+    .select("*")
+    .eq("id", run_id)
+    .single();
+
+  if (runError || !runData) {
+    return new Response("run-not-found", { status: 404 });
+  }
+
+  const run = runData;
+
+  // Compensation only applies to failed runs
+  if (run.state !== "failed") {
+    return new Response(
+      JSON.stringify({
+        status: "compensation-not-required",
+        run_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 2. Load version + graph
+  const version = await loadVersion(run.workflow_version_id);
+  const graph = version.graph;
+
+  const compensationEnabled = graph.compensation?.enabled ?? false;
+  if (!compensationEnabled) {
+    return new Response(
+      JSON.stringify({
+        status: "compensation-disabled",
+        run_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 3. Load compensation steps
+  const steps = await loadSteps(run_id);
+  const compSteps = steps.filter((s) => s.type === "compensation");
+
+  if (compSteps.length === 0) {
+    return new Response(
+      JSON.stringify({
+        status: "no-compensation-steps",
+        run_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 4. Detect incomplete compensation
+  const allCompleted = compSteps.every((s) => s.state === "completed");
+  const anyFailed = compSteps.some((s) => s.state === "failed");
+
+  // 5. Detect stuck compensation steps
+  const now = Date.now();
+  const stuckSteps = compSteps.filter(
+    (s) =>
+      s.state === "running" &&
+      now - new Date(s.created_at).getTime() > COMP_TIMEOUT_MS
+  );
+
+  // 6. Detect invalid DAG nodes
+  const nodeIds = new Set(graph.nodes.map((n: any) => n.id));
+  const invalidSteps = compSteps.filter((s) => !nodeIds.has(s.step_id));
+
+  if (allCompleted && invalidSteps.length === 0 && stuckSteps.length === 0) {
+    return new Response(
+      JSON.stringify({
+        status: "compensation-complete",
+        run_id,
+      }),
+      { status: 200 }
+    );
+  }
+
+  // 7. Reset stuck or invalid compensation steps
+  for (const step of [...stuckSteps, ...invalidSteps]) {
+    await supabase
+      .from("workflow_step_runs")
+      .update({
+        state: "pending",
+        error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", step.id);
+  }
+
+  // 8. Reset failed compensation steps
+  if (anyFailed) {
+    for (const step of compSteps.filter((s) => s.state === "failed")) {
+      await supabase
+        .from("workflow_step_runs")
+        .update({
+          state: "pending",
+          error: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", step.id);
+    }
+  }
+
+  // 9. Requeue compensation jobs
+  const jobs = await loadJobs(run_id);
+  const compJobs = jobs.filter((j) => j.type === "compensation");
+
+  for (const job of compJobs) {
+    await supabase
+      .from("workflow_jobs")
+      .update({
+        state: "pending",
+        claimed_at: null,
+        lease_expires_at: null,
+        error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", job.id);
+  }
+
+  await supabase.functions.invoke("schedule-next-job", {
+    body: { run_id },
+  });
+
+  // 10. Record provenance
+  await supabase
+    .from("workflow_compensation_repair")
+    .insert({
+      run_id,
+      repaired_at: new Date().toISOString(),
+      stuck_steps: stuckSteps.map((s) => s.id),
+      invalid_steps: invalidSteps.map((s) => s.id),
+      failed_steps: compSteps.filter((s) => s.state === "failed").map((s) => s.id),
+    })
+    .catch(() => {});
+
+  return new Response(
+    JSON.stringify({
+      status: "compensation-repaired",
+      run_id,
+      stuck_steps: stuckSteps.map((s) => s.id),
+      invalid_steps: invalidSteps.map((s) => s.id),
+      failed_steps: compSteps.filter((s) => s.state === "failed").map((s) => s.id),
+    }),
+    { status: 200 }
+  );
+});
+
+// ------------------------------------------------------------
+// Loaders
+// ------------------------------------------------------------
+
+async function loadVersion(versionId: string) {
+  const { data } = await supabase
+    .from("workflow_versions")
+    .select("*")
+    .eq("id", versionId)
+    .single();
+  return data ?? null;
+}
+
+async function loadSteps(run_id: string) {
+  const { data } = await supabase
+    .from("workflow_step_runs")
+    .select("*")
+    .eq("run_id", run_id);
+  return data ?? [];
+}
+
+async function loadJobs(run_id: string) {
+  const { data } = await supabase
+    .from("workflow_jobs")
+    .select("*")
+    .eq("run_id", run_id);
+  return data ?? [];
+}
