@@ -1,19 +1,23 @@
 // supabase/functions/aggregate-run-metrics/index.ts
-// Valtaris Glue — Run Metrics Aggregator
+// Valtaris Glue — Run-Level Metrics Aggregator (Generation 3)
 //
-// This file aggregates metrics at the workflow run level.
-// It produces analytics such as:
-//   - run duration
+// This file aggregates raw job + step metrics into run-level analytics:
+//   - total run duration
+//   - avg step duration
+//   - p95 step latency
+//   - run error rate
 //   - run success rate
-//   - run failure rate
-//   - compensation rate
-//   - DLQ rate
-//   - stuck-run frequency
-//   - throughput (runs/minute)
-//   - latency distribution
+//   - reliability scoring
 //
 // Authority chain:
-//   collect-metrics → aggregate-run-metrics → dashboards
+//   collect-metrics → aggregate-job-step-metrics → aggregate-run-metrics → workflow_run_aggregates
+//
+// This file NEVER:
+//   - mutates workflow_runs directly
+//   - mutates workflow_versions
+//   - executes connectors
+//   - schedules jobs
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -23,58 +27,156 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date().toISOString();
+
+// ------------------------------------------------------------
+// Aggregation Window
+// ------------------------------------------------------------
+
+const WINDOW_MINUTES = 5; // 5‑minute rolling window
+
+function windowStart() {
+  return new Date(Date.now() - WINDOW_MINUTES * 60 * 1000).toISOString();
+}
+
+// ------------------------------------------------------------
+// Main Handler
+// ------------------------------------------------------------
+
 serve(async () => {
-  // 1. Load all runs
-  const { data: runs } = await supabase
-    .from("workflow_runs")
-    .select("*");
+  try {
+    const start = windowStart();
 
-  // 2. Load metrics
-  const { data: metrics } = await supabase
-    .from("workflow_metrics")
-    .select("*");
+    // Load job/step aggregates for the window
+    const { data: aggregates, error } = await supabase
+      .from("workflow_job_step_aggregates")
+      .select("*")
+      .gte("window_start", start);
 
-  const aggregates = [];
+    if (error) {
+      return jsonError("load-aggregates-failed", 500, error);
+    }
 
-  for (const run of runs) {
-    const runMetrics = metrics.filter((m: any) => m.run_id === run.id);
+    if (!aggregates || aggregates.length === 0) {
+      return jsonOK({
+        status: "no-aggregates",
+        window_start: start,
+      });
+    }
 
-    const start = new Date(run.created_at).getTime();
-    const end = new Date(run.completed_at ?? Date.now()).getTime();
-    const durationMs = end - start;
+    // Group by run_id
+    const grouped: Record<string, any[]> = {};
+    for (const row of aggregates) {
+      const runId = row.run_id ?? "unknown";
+      if (!grouped[runId]) grouped[runId] = [];
+      grouped[runId].push(row);
+    }
 
-    const success = run.state === "completed";
-    const failed = run.state === "failed";
-    const compensated = run.state === "compensated";
-    const replayed = run.state === "replay_completed";
+    // Aggregate each run
+    const runAggregates = [];
+    for (const runId of Object.keys(grouped)) {
+      const rows = grouped[runId];
 
-    const dlqCount = runMetrics.filter((m: any) => m.event === "dlq").length;
-    const stuckCount = runMetrics.filter((m: any) => m.event === "stuck-run").length;
-    const repairCount = runMetrics.filter((m: any) => m.event === "repair").length;
+      const durations = rows
+        .map((r) => r.avg_duration_ms)
+        .filter((d) => typeof d === "number");
 
-    aggregates.push({
-      run_id: run.id,
-      workflow_version_id: run.workflow_version_id,
-      duration_ms: durationMs,
-      success,
-      failed,
-      compensated,
-      replayed,
-      dlq_count: dlqCount,
-      stuck_count: stuckCount,
-      repair_count: repairCount,
-      created_at: new Date().toISOString(),
+      const p95s = rows
+        .map((r) => r.p95_latency_ms)
+        .filter((d) => typeof d === "number");
+
+      const errorRates = rows.map((r) => r.error_rate);
+      const successRates = rows.map((r) => r.success_rate);
+
+      const totalDuration =
+        durations.length > 0 ? durations.reduce((a, b) => a + b, 0) : null;
+
+      const avgStepDuration =
+        durations.length > 0
+          ? durations.reduce((a, b) => a + b, 0) / durations.length
+          : null;
+
+      const p95Latency =
+        p95s.length > 0 ? percentile(p95s, 95) : null;
+
+      const avgErrorRate =
+        errorRates.length > 0
+          ? errorRates.reduce((a, b) => a + b, 0) / errorRates.length
+          : 0;
+
+      const avgSuccessRate =
+        successRates.length > 0
+          ? successRates.reduce((a, b) => a + b, 0) / successRates.length
+          : 0;
+
+      const reliabilityScore = computeReliability(avgSuccessRate, p95Latency);
+
+      runAggregates.push({
+        run_id: runId,
+        window_start: start,
+        window_end: NOW(),
+        step_count: rows.length,
+        total_duration_ms: totalDuration,
+        avg_step_duration_ms: avgStepDuration,
+        p95_latency_ms: p95Latency,
+        error_rate: avgErrorRate,
+        success_rate: avgSuccessRate,
+        reliability_score: reliabilityScore,
+        created_at: NOW(),
+      });
+    }
+
+    // Insert run-level aggregates
+    const { error: insertErr } = await supabase
+      .from("workflow_run_aggregates")
+      .insert(runAggregates);
+
+    if (insertErr) {
+      return jsonError("insert-run-aggregates-failed", 500, insertErr);
+    }
+
+    return jsonOK({
+      status: "run-aggregated",
+      window_start: start,
+      runs: runAggregates.length,
     });
+  } catch (err) {
+    return jsonError("aggregate-run-metrics-failed", 500, String(err));
   }
+});
 
-  // 3. Store aggregated metrics
-  await supabase.from("workflow_run_metrics").insert(aggregates);
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
 
+function percentile(arr: number[], p: number) {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
+
+function computeReliability(successRate: number, p95Latency: number | null) {
+  if (p95Latency === null) return successRate;
+  const latencyPenalty = Math.min(p95Latency / 5000, 1); // 5s cap
+  return Math.max(0, successRate - latencyPenalty);
+}
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status: number, details?: any) {
   return new Response(
     JSON.stringify({
-      status: "run-metrics-aggregated",
-      count: aggregates.length,
+      error: code,
+      details,
     }),
-    { status: 200 }
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
   );
-});
+}
