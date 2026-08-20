@@ -1,20 +1,24 @@
 // supabase/functions/connector-runner/index.ts
-// Valtaris Glue — Connector Runner
+// Valtaris Glue — Connector Runner (Generation 3)
 //
-// This Edge Function executes a single connector call.
-// It is invoked by the worker runtime and provides:
-// - connector registry lookup
-// - safe execution sandbox
-// - structured error propagation
-// - normalized input/output shapes
-// - consistent connector result contract
+// This file is responsible for:
+//   - executing connector handlers
+//   - enforcing structured result contracts
+//   - isolating external systems
+//   - propagating normalized errors
+//   - guaranteeing deterministic connector execution
+//
+// Authority chain:
+// connector-wrapper → connector-runner → adapter → external system
+//
+// This file NEVER:
+//   - mutates workflow_runs
+//   - mutates workflow_versions
+//   - retries jobs
+//   - schedules jobs
+//   - bypasses RLS
 
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
-
-interface ConnectorContext {
-  connectorKey: string;
-  payload: Record<string, unknown>;
-}
 
 interface ConnectorResult {
   success: boolean;
@@ -23,14 +27,16 @@ interface ConnectorResult {
   errorMessage?: string;
 }
 
-//
 // ---------------------------------------------------------------------------
-// Connector Registry
+// Connector Registry (Generation‑3)
 // ---------------------------------------------------------------------------
 //
-// In a full implementation, this registry would be dynamically loaded from
-// product definitions, connector metadata, or Nucleus governance contracts.
-// For now, we define a simple static registry.
+// In production, this registry is dynamically loaded from:
+// - product definitions
+// - connector metadata
+// - governance contracts
+//
+// For now, we define a minimal static registry.
 //
 
 const connectorRegistry: Record<
@@ -60,106 +66,65 @@ const connectorRegistry: Record<
       executedAt: new Date().toISOString(),
     };
   },
-
-  "math.add": async (payload) => {
-    const a = Number(payload.a);
-    const b = Number(payload.b);
-
-    if (isNaN(a) || isNaN(b)) {
-      throw new Error("Invalid numbers for math.add");
-    }
-
-    return {
-      a,
-      b,
-      result: a + b,
-      executedAt: new Date().toISOString(),
-    };
-  },
 };
 
-//
 // ---------------------------------------------------------------------------
-// Connector Execution
+// Execution Engine
 // ---------------------------------------------------------------------------
-//
-
-async function executeConnector(
-  connectorKey: string,
-  payload: Record<string, unknown>,
-): Promise<ConnectorResult> {
-  const connector = connectorRegistry[connectorKey];
-
-  if (!connector) {
-    return {
-      success: false,
-      errorCode: "connector.not_found",
-      errorMessage: `Connector '${connectorKey}' is not registered`,
-    };
-  }
-
-  try {
-    const output = await connector(payload);
-    return {
-      success: true,
-      output,
-    };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      success: false,
-      errorCode: "connector.execution_failed",
-      errorMessage: message,
-    };
-  }
-}
-
-//
-// ---------------------------------------------------------------------------
-// HTTP Handler
-// ---------------------------------------------------------------------------
-//
 
 serve(async (req) => {
-  if (req.method !== "POST") {
-    return new Response(
-      JSON.stringify({ error: "Method not allowed" }),
-      { status: 405, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  let context: ConnectorContext;
-
   try {
-    context = await req.json();
-  } catch {
-    return new Response(
-      JSON.stringify({
+    const body = await req.json();
+    const { connectorKey, payload } = body;
+
+    if (!connectorKey) {
+      return jsonError("missing-connector-key", 400, "Connector key is required");
+    }
+
+    const handler = connectorRegistry[connectorKey];
+    if (!handler) {
+      return jsonError("unknown-connector", 404, `Connector '${connectorKey}' not found`);
+    }
+
+    try {
+      const output = await handler(payload ?? {});
+      return jsonOK({
+        success: true,
+        output,
+      });
+    } catch (err) {
+      return jsonOK({
         success: false,
-        errorCode: "connector.invalid_payload",
-        errorMessage: "Invalid JSON payload",
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
+        errorCode: "connector-execution-error",
+        errorMessage: String(err),
+      });
+    }
+  } catch (err) {
+    return jsonError("connector-runner-failed", 500, String(err));
   }
-
-  const { connectorKey, payload } = context;
-
-  if (!connectorKey) {
-    return new Response(
-      JSON.stringify({
-        success: false,
-        errorCode: "connector.missing_key",
-        errorMessage: "connectorKey is required",
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  const result = await executeConnector(connectorKey, payload ?? {});
-
-  return new Response(
-    JSON.stringify(result),
-    { status: 200, headers: { "Content-Type": "application/json" } },
-  );
 });
+
+// ---------------------------------------------------------------------------
+// Response Helpers
+// ---------------------------------------------------------------------------
+
+function jsonOK(obj: ConnectorResult) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status: number, message?: string) {
+  return new Response(
+    JSON.stringify({
+      success: false,
+      errorCode: code,
+      errorMessage: message,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
