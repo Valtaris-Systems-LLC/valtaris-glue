@@ -1,5 +1,5 @@
 // supabase/functions/connector-telemetry/index.ts
-// Valtaris Glue — Connector Logging & Telemetry
+// Valtaris Glue — Connector Logging & Telemetry (Generation 3)
 //
 // This file records ALL connector activity:
 //   - connector name
@@ -22,7 +22,7 @@
 //   - performance metrics
 //
 // Authority chain:
-//   connector-wrapper → connector-telemetry → workflow_logs
+//   connector-wrapper → connector-telemetry → workflow_connector_logs
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -32,50 +32,78 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date().toISOString();
+
 serve(async (req) => {
-  const body = await req.json();
-  const {
-    connector,
-    idempotencyKey,
-    payload,
-    result,
-    error,
-    durationMs,
-    run_id,
-    job_id,
-    step_id,
-  } = body;
+  try {
+    const body = await req.json();
 
-  if (!connector || !idempotencyKey) {
-    return new Response("missing-connector-or-idempotency-key", { status: 400 });
-  }
-
-  // 1. Insert telemetry log
-  const { error: logErr } = await supabase
-    .from("workflow_connector_logs")
-    .insert({
+    const {
       connector,
-      idempotency_key: idempotencyKey,
+      idempotencyKey,
       payload,
       result,
       error,
-      duration_ms: durationMs,
+      durationMs,
       run_id,
       job_id,
       step_id,
-      created_at: new Date().toISOString(),
-    });
+    } = body;
 
-  if (logErr) {
-    return new Response("telemetry-log-failed", { status: 500 });
-  }
+    if (!connector || !idempotencyKey) {
+      return jsonError("missing-connector-or-idempotency-key", 400);
+    }
 
-  return new Response(
-    JSON.stringify({
+    // Insert telemetry log
+    const { error: logErr } = await supabase
+      .from("workflow_connector_logs")
+      .insert({
+        connector,
+        idempotency_key: idempotencyKey,
+        payload,
+        result,
+        error,
+        duration_ms: durationMs,
+        run_id,
+        job_id,
+        step_id,
+        created_at: NOW(),
+      });
+
+    if (logErr) {
+      return jsonError("telemetry-insert-failed", 500, logErr);
+    }
+
+    return jsonOK({
+      status: "telemetry-recorded",
       connector,
       idempotencyKey,
-      status: "logged",
-    }),
-    { status: 200 }
-  );
+    });
+  } catch (err) {
+    return jsonError("connector-telemetry-failed", 500, String(err));
+  }
 });
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status: number, details?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
