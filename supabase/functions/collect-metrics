@@ -1,8 +1,8 @@
 // supabase/functions/collect-metrics/index.ts
-// Valtaris Glue — Metrics Collector
+// Valtaris Glue — Raw Metrics Collector (Generation 3)
 //
-// This file collects raw metrics emitted by the runtime.
-// It stores metrics for later aggregation.
+// This file collects ALL raw metrics emitted by the runtime.
+// It is intentionally simple, append-only, and high-throughput.
 //
 // Metrics collected:
 //   - job execution duration
@@ -16,7 +16,7 @@
 //   - invariant violations
 //
 // Authority chain:
-//   collect-metrics → metrics tables → aggregators → dashboards
+//   runtime → collect-metrics → workflow_metrics → aggregators → dashboards
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -26,44 +26,74 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
+const NOW = () => new Date().toISOString();
+
 serve(async (req) => {
-  const body = await req.json();
+  try {
+    const body = await req.json();
 
-  const {
-    run_id,
-    job_id,
-    step_id,
-    connector,
-    event,
-    duration_ms,
-    error,
-    metadata,
-  } = body;
-
-  if (!event) {
-    return new Response("missing-event", { status: 400 });
-  }
-
-  await supabase.from("workflow_metrics").insert({
-    run_id,
-    job_id,
-    step_id,
-    connector,
-    event,
-    duration_ms,
-    error,
-    metadata,
-    created_at: new Date().toISOString(),
-  });
-
-  return new Response(
-    JSON.stringify({
-      status: "metric-recorded",
-      event,
+    const {
       run_id,
       job_id,
       step_id,
-    }),
-    { status: 200 }
-  );
+      connector,
+      event,
+      duration_ms,
+      error,
+      metadata,
+    } = body;
+
+    if (!event) {
+      return jsonError("missing-event", 400, "Metric event type is required");
+    }
+
+    const { error: insertErr } = await supabase
+      .from("workflow_metrics")
+      .insert({
+        run_id,
+        job_id,
+        step_id,
+        connector,
+        event,
+        duration_ms,
+        error,
+        metadata,
+        created_at: NOW(),
+      });
+
+    if (insertErr) {
+      return jsonError("metric-insert-failed", 500, insertErr);
+    }
+
+    return jsonOK({
+      status: "metric-recorded",
+      event,
+    });
+  } catch (err) {
+    return jsonError("collect-metrics-failed", 500, String(err));
+  }
 });
+
+// ------------------------------------------------------------
+// Response Helpers
+// ------------------------------------------------------------
+
+function jsonOK(obj: any) {
+  return new Response(JSON.stringify(obj), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function jsonError(code: string, status: number, details?: any) {
+  return new Response(
+    JSON.stringify({
+      error: code,
+      details,
+    }),
+    {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+}
