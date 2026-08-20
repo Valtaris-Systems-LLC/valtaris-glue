@@ -11,7 +11,7 @@
 //   - producing a clean audit record for replay + observability
 //
 // Authority chain:
-//   finalize-run → audit-run → replay-workflow (optional)
+// finalize-run → audit-run → replay-workflow (optional)
 //
 // This file NEVER:
 //   - executes connectors
@@ -26,6 +26,8 @@ const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
+
+const NOW = () => new Date();
 
 serve(async (req) => {
   try {
@@ -54,16 +56,16 @@ serve(async (req) => {
       job_state_summary: summarizeJobStates(jobs),
       dag_completeness: checkDagCompleteness(version, steps),
       terminal_state_valid: checkTerminalState(run, steps),
-      created_at: new Date(),
+      created_at: NOW(),
     };
 
     // Emit audit event
     await supabase.from("workflow_events").insert({
       run_id,
       step_id: null,
-      type: "run.audit",
+      type: "run.audit.completed",
       details: audit,
-      created_at: new Date(),
+      created_at: NOW(),
     });
 
     // Store audit record
@@ -71,6 +73,7 @@ serve(async (req) => {
 
     return jsonOK({
       status: "audit-complete",
+      run_id,
       audit,
     });
   } catch (err) {
@@ -105,8 +108,7 @@ async function loadStepRuns(runId: string) {
   const { data } = await supabase
     .from("workflow_step_runs")
     .select("*")
-    .eq("run_id", runId)
-    .order("created_at", { ascending: true });
+    .eq("run_id", runId);
   return data ?? [];
 }
 
@@ -139,39 +141,28 @@ function summarizeJobStates(jobs: any[]) {
 }
 
 // ------------------------------------------------------------
-// DAG Completeness Check
+// DAG Completeness
 // ------------------------------------------------------------
 
 function checkDagCompleteness(version: any, steps: any[]) {
-  const completed = new Set(
-    steps.filter((s) => s.state === "completed").map((s) => s.step_id)
-  );
+  const nodeIds = new Set(version.graph.nodes.map((n: any) => n.id));
+  const completedSteps = new Set(steps.map((s: any) => s.step_id));
 
-  const missing: string[] = [];
-
-  for (const node of version.graph.nodes) {
-    if (!completed.has(node.id)) {
-      missing.push(node.id);
-    }
-  }
+  const missing = [...nodeIds].filter((id) => !completedSteps.has(id));
 
   return {
-    total_nodes: version.graph.nodes.length,
-    completed_nodes: completed.size,
-    missing_nodes: missing,
     complete: missing.length === 0,
+    missing_steps: missing,
   };
 }
 
 // ------------------------------------------------------------
-// Terminal State Check
+// Terminal State Validation
 // ------------------------------------------------------------
 
 function checkTerminalState(run: any, steps: any[]) {
   const failed = steps.some((s) => s.state === "failed");
-  const completed = steps.every(
-    (s) => s.state === "completed" || s.state === "approved"
-  );
+  const completed = steps.every((s) => s.state === "completed");
 
   if (run.state === "completed") {
     return completed;
@@ -179,10 +170,6 @@ function checkTerminalState(run: any, steps: any[]) {
 
   if (run.state === "failed") {
     return failed;
-  }
-
-  if (run.state === "cancelled") {
-    return true;
   }
 
   return false;
